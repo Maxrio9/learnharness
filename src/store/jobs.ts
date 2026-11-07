@@ -62,6 +62,7 @@ function getJob(id: string): JobRecord | null {
 function updateJob(id: string, patch: JobPatch): JobRecord | null {
 	const record = getJob(id);
 	if (!record) return null;
+	if (record.kind === "experiment" && patch.input !== undefined) throw new Error("Experiment plan is immutable");
 	const next: JobRecord = { ...record, ...patch, updatedAt: patch.updatedAt ?? new Date().toISOString() };
 	writeFileAtomicSync(jobFile(id), JSON.stringify(next, null, "\t"), { allowInPlaceFallback: true });
 	// EVERY write, not just status flips: progress-line updates must reach

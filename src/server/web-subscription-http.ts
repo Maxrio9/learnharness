@@ -9,6 +9,13 @@ export function subscriptionRequestOrigin(request: Request): string | undefined 
 	try {
 		const url = new URL(request.url);
 		const host = request.headers.get("host") ?? url.host;
+		// The optional private HTTPS proxy terminates TLS before this loopback server.
+		// Trust only a configured exact host, never arbitrary X-Forwarded-* values.
+		const remote = process.env.LH_CURRICULUM_TAILNET_ORIGIN;
+		if (remote) {
+			const configured = new URL(remote);
+			if (configured.protocol === "https:" && !configured.username && !configured.password && configured.pathname === "/" && !configured.search && !configured.hash && configured.host === host) return configured.origin;
+		}
 		const addressed = new URL(`${url.protocol}//${host}`);
 		if (!["http:", "https:"].includes(addressed.protocol) || addressed.username || addressed.password || addressed.pathname !== "/" || addressed.search || addressed.hash) return;
 		return addressed.origin;

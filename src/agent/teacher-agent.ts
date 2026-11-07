@@ -100,6 +100,8 @@ export type StepUsageCollector = (usage: Usage) => void;
 
 /** Per-request construction options (the handler wires all of these). */
 export interface AgentBuildOptions {
+	/** One bounded recovery request after an explicit graded-answer POST. */
+	postAnswerContinuation?: boolean;
 	/** Model + stream function — tests inject a scripted faux engine. */
 	engine?: PiEngine;
 	callPurpose?: { background: boolean };
@@ -183,6 +185,17 @@ function baseAgentOptions(kind: AgentKind, opts: AgentBuildOptions, tools: Agent
 	// ("practice" is not a ModelRole) honest about that.
 	const engine = opts.engine ?? piEngineFor(kind as "prober" | "teacher");
 	const stopper = makeQuestionStopper(kind);
+	const history = opts.messages ?? [];
+	const last = history.at(-1);
+	const conversational = last?.role === "user";
+	const learnerText = conversational
+		? (typeof last.content === "string" ? last.content : last.content.filter(b => b.type === "text").map(b => b.type === "text" ? b.text : "").join("\n"))
+		: String((last?.role === "toolResult" ? last.details as { text?: unknown } : undefined)?.text ?? "");
+	let recoverAnswer = opts.postAnswerContinuation === true && kind !== "practice" && last !== undefined &&
+		(conversational || (last.role === "toolResult" && (QUESTION_TOOLS as readonly string[]).includes(last.toolName))) &&
+		nativeInputCause(last, history.slice(0, -1)) === "learner" &&
+		!(/\b(stop|pause|end (?:the |this )?session|take a break|aufhören|beenden|pausieren)\b/i.test(learnerText));
+	let recoveryReminder = false;
 	const narrationGuard = narrationGuardApplies(kind, engine.model, opts.tools !== undefined);
 	const composedPrompt = opts.promptSwitches
 		? composeInstructions(kind, opts.promptSwitches)
@@ -224,7 +237,33 @@ function baseAgentOptions(kind: AgentKind, opts: AgentBuildOptions, tools: Agent
 		// exits BEFORE the steering poll — the parked-marker stranding our
 		// Wave C registerLiveAgent-before-runPiTurn design depends on.
 		// undefined preserves normal scheduling (the old boolean false).
-		finishTurn: (turn) => (stopper(turn) ? { action: "end" } : undefined),
+		finishTurn: (turn, signal) => {
+			if (stopper(turn)) return { action: "end" };
+			// Do not pose over an unanswered sibling from the incoming transcript.
+			const resolved = new Set(history.filter(m => m.role === "toolResult").map(m => m.toolCallId));
+			if (history.some(m => m.role === "assistant" && m.content.some(b =>
+				b.type === "toolCall" && (QUESTION_TOOLS as readonly string[]).includes(b.name) && !resolved.has(b.id)))) {
+				recoverAnswer = false;
+			}
+			// A transition or fresh learner/automatic input supersedes this answer.
+			if (signal?.aborted || turn.message.stopReason === "error" || turn.message.stopReason === "aborted" ||
+				turn.newMessages.some(m => m.role !== "assistant" && m.role !== "toolResult") ||
+				turn.newMessages.some(m => m.role === "assistant" && m.content.some(b => b.type === "toolCall" && ["probe_done", "conclude"].includes(b.name)))) {
+				recoverAnswer = false;
+			}
+			if (recoverAnswer && turn.message.stopReason === "stop" && !turn.message.content.some(b => b.type === "toolCall")) {
+				const delivered = turn.message.content.filter(b => b.type === "text").map(b => b.type === "text" ? b.text : "").join("\n").trim();
+				// A visible question or explicitly labelled task already hands
+				// control to the learner. Do not generate over that handoff.
+				const handoff = /\?\s*[*_]*\s*$/.test(delivered) ||
+					/\b(?:bring back|report back|try this|your (?:next )?task|next action)\b|\bnext step\s*:/i.test(delivered);
+				recoverAnswer = false;
+				if (!handoff) {
+					recoveryReminder = true;
+					return { action: "continue" };
+				}
+			}
+		},
 		// Wave C (2026-09-26, owner correction same day): markers handed to a
 		// live run drain from pi's STEERING queue — the lesson loop is one
 		// continuous teach→quiz→teach run, so delivery must inject at turn
@@ -241,6 +280,14 @@ function baseAgentOptions(kind: AgentKind, opts: AgentBuildOptions, tools: Agent
 		// must never throw (pi's convertToLlm contract).
 		convertToLlm: toLlmMessages,
 		prepareRequest: (request) => {
+			if (recoveryReminder) {
+				recoveryReminder = false;
+				const instruction = request.context.messages.find(m => m.role === "system");
+				if (instruction?.role === "system") {
+					const base = typeof instruction.content === "string" ? instruction.content : instruction.content.map(b => b.text).join("\n");
+					instruction.content = base + "\n\nTURN COMPLETION: Your feedback has already been delivered, but no next question or learner action was delivered. Complete this step now: use the available question tool (ask_user_question for a conversational check, or the configured quiz/recall tool) to ask one relevant follow-up, then wait. Alternatively deliver one explicit learner-owned action with clear return instructions. Do not repeat the feedback or merely announce a future question. Respect pauses and do not reveal an unfinished exercise solution.";
+				}
+			}
 			if (opts.callPurpose) {
 				let learner = false, automatic = false;
 				const messages = request.context.messages;

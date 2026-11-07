@@ -141,7 +141,7 @@ test("real conversation wiring inherits live Strong retention without changing t
 	assert.equal(response.status, 200, await response.clone().text());
 	const handle = runningTurn(chat.id);
 	if (handle) await new Response(handle.subscribe()).text();
-	assert.deepEqual(seen.map((call) => [call.model, call.options.cacheRetention]), [["chat-model", "long"], ["chat-model", "short"]]);
+	assert.deepEqual(seen.map((call) => [call.model, call.options.cacheRetention]), [["chat-model", "long"], ["chat-model", "short"], ["chat-model", "short"]]); // the third call is the bounded post-answer continuation request
 	assert.deepEqual(chatStore.getChat(chat.id)?.settings?.model, { provider: id, id: "chat-model" });
 	piModels().deleteProvider(id);
 });

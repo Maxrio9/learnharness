@@ -1,3 +1,4 @@
+import { revokeExperiment } from "./experiments/service.ts";
 import { abortExtraction, extractionStatuses } from "../agent/subagents/extraction.ts";
 import { isJobLive } from "../agent/subagents/aborts.ts";
 import { coverageOf } from "../core/coverage.ts";
@@ -82,7 +83,7 @@ export function runningWorkBlocker(chatId: string): Extract<ChatDeleteOutcome, {
 	// result without a live loop is pending session data, not computing work;
 	// deletion must not depend on a prior recovery poll to recognize it.
 	const runningJobs = stores.jobStore.listJobs(chatId).filter((job) =>
-		job.status === "running" && (!job.result || isJobLive(job.id)));
+		job.status === "running" && !(job.kind === "experiment" && job.experiment?.state === "awaiting_approval") && (!job.result || isJobLive(job.id)));
 	if (runningJobs.length > 0) {
 		return {
 			ok: false,
@@ -148,6 +149,8 @@ function finishChatDeletion(chatId: string, mode: ChatDeleteMode): Extract<ChatD
 }
 
 function finishChatRecordDeletion(chatId: string): number {
+	// Pending proposals are inert, but deletion must revoke their authority.
+	for (const job of stores.jobStore.listJobs(chatId)) if (job.kind === "experiment" && job.experiment?.state === "awaiting_approval") revokeExperiment(job);
 	const jobsRemoved = stores.jobStore.deleteJobsForChat(chatId);
 	if (stores.chatStore.deleteChat(chatId)) {
 		discardChatDeliveries(chatId);

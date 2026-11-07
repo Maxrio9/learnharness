@@ -1,3 +1,4 @@
+import { recoverExperiment, revokeExperiment } from './experiments/service.ts';
 /**
  * THE WAKE PIPELINE (contracts.ts "THE ASYNC PROTOCOL" §4) — server-side
  * steer delivery for finished sub-agent jobs. Wave C (2026-09-26):
@@ -437,7 +438,15 @@ export function abortJob(jobId: string): AbortOutcome {
 		return { ok: false, reason: "not_running" };
 	}
 
-	fireJobAbort(jobId);
+	revokeExperiment(job);
+	// A consumed orphan may still own a systemd cgroup after a server restart.
+	if (job.kind === "experiment" && job.experiment?.state !== "awaiting_approval" && !isJobLive(jobId)) void recoverExperiment(stores.jobStore.getJob(jobId)!);
+	fireJobAbort(jobId, job.kind === "experiment");
+	if (job.kind === "experiment" && isJobLive(jobId)) {
+		// Receipt and terminal state follow owned cgroup cleanup, never the click.
+		stores.jobStore.updateJob(jobId, { activity: "cancelling — awaiting cleanup receipt" });
+		return { ok: true };
+	}
 	stores.jobStore.updateJob(jobId, {
 		status: "error", error: "Aborted by learner", activity: "aborted",
 		delivery: { kind: "abort", status: "pending" },
@@ -744,6 +753,7 @@ export function recoverStaleJobs(): void {
 				if (isJobLive(job.id)) continue; // never re-run beside live computation
 				if (!stores.chatStore.getChat(job.chatId)) continue;
 				if (isTurnRunning(job.chatId)) continue;
+				if (job.kind === "experiment" && job.status === "running" && !job.result) { void recoverExperiment(job); continue; }
 				const recovered = normalizeLegacyResult(job);
 				if (recovered.delivery?.status === "pending") {
 					restorePendingDeliveries(job.chatId);

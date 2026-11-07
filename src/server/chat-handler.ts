@@ -104,6 +104,16 @@ const jobRunner = createJobRunner({
 	// undefined and the runner refuses the spawn honestly.
 	engineFor: (role) =>
 		resolveEngine(role),
+	// This dedicated inference curriculum uses the configured local Spark broker.
+	// Do not redirect an arbitrary custom endpoint or change the research role.
+	// The experiment specialist is interactive work the learner is waiting on, so it uses the
+	// FOREGROUND endpoint (set LH_EXPERIMENT_LOCAL_BASE_URL to it); a background endpoint would defer it behind other jobs.
+	experimentEngine: () => {
+		const cp=stores.settingsStore.readSettings()?.customProvider;
+		const localBase = process.env.LH_EXPERIMENT_LOCAL_BASE_URL;
+		if (!localBase || cp?.baseUrl !== localBase || !cp.models?.some(m=>m.id === "local")) return undefined;
+		return piEngineForSpec({provider:"custom",id:"local",thinkingLevel:"high"}, true);
+	},
 	// Key-presence gate (provider-key interlude, 2026-09-25): the runner
 	// reads the resolved engine's provider and asks THIS check (the agent
 	// layer may not read the key store); a missing key refuses the spawn
@@ -447,6 +457,7 @@ export async function handleChatInput(
 		restoreAutomatic: (automaticIds, retainedIds) => restoreUncommittedAutomatic(chatId, constructed, automaticIds, retainedIds),
 	});
 	const agentOpts: AgentBuildOptions = {
+		postAnswerContinuation: input.type === "answer" || input.type === "text",
 		engine,
 		callPurpose,
 		requestCycle,

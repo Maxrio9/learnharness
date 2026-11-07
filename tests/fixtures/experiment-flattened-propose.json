@@ -1,0 +1,14 @@
+{
+ "action": "propose_locked",
+ "locks": "[{\"lockId\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"name\": \"engine-a\"}, {\"lockId\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"name\": \"engine-b\"}]",
+ "plan": "{\"commands\": [[\"/usr/bin/python3\", \"-I\", \"-c\", \"print(\\\"SUMMARY\\\")\\nprint(\\\"DONE\\\")\"]]",
+ "exports": "[{\"maxBytes\": 16384, \"path\": \"results/summary.json\"}]",
+ "gpu": "true",
+ "inputs": "[]",
+ "limits": "{\"artifactBytes\": 536870912, \"diskMiB\": 16384, \"memoryMiB\": 24576, \"outputBytes\": 65536, \"stagedCacheMiB\": 12288, \"tasks\": 6, \"wallSeconds\": 3600}",
+ "model": "{\"files\": [{\"bytes\": 1570, \"name\": \"config.json\", \"sha256\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}], \"repo\": \"example-org/example-model\", \"revision\": \"dddddddddddddddddddddddddddddddddddddddd\"}",
+ "network": "internal-loopback",
+ "purpose": "Synthetic example of a flattened propose_locked call: the plan fields arrive as top-level arguments and the plan string is cut off before its closing brace.",
+ "title": "Synthetic flattened proposal",
+ "version": "3"
+}

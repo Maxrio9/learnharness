@@ -53,6 +53,9 @@ export interface SubagentRunResult {
 	newMessages: AgentMessage[];
 	/** The final assistant text (the deliverable). */
 	text: string;
+	/** The turn cap ended the run while the model still wanted to act (its last message asked for tools),
+	 *  so `text` is a mid-task note, not a finished deliverable. */
+	hitTurnLimit?: boolean;
 }
 
 export function subagentEngine(role: ModelRole, override?: PiEngine): PiEngine {
@@ -164,5 +167,6 @@ export async function runSubagent(tools: AgentTool<any, any>[], opts: SubagentRu
 				.map((c) => c.text)
 				.join("")
 		: "";
-	return { newMessages, text };
+	const hitTurnLimit = turns >= opts.maxTurns && last?.stopReason === "toolUse";
+	return { newMessages, text, hitTurnLimit };
 }

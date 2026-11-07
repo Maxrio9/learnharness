@@ -5,8 +5,10 @@ import type { PdfResult, ResearchResult, SubagentArtifactData } from "@/src/core
 import type { LhViewMessage } from "@/src/core";
 import { isSubagentFailure } from "@/src/core";
 import { DemoOutputCard } from "@/components/artifacts/demo-card";
+import { ExperimentReceipt } from "@/components/artifacts/experiment-card";
 import { PdfBriefCard, ResearchBriefCard } from "@/components/artifacts/job-card";
 import { VisualOutputCard } from "@/components/artifacts/visual-card";
+import type { ExperimentResult } from "@/src/core/contracts/experiment";
 
 /**
  * The sub-agent result delivery card (contracts.ts "THE ASYNC PROTOCOL" §4).
@@ -43,6 +45,8 @@ export function SubagentSteerCard({ message }: { message: LhViewMessage }) {
 		);
 	}
 	switch (data.kind) {
+		case "experiment":
+			return <ExperimentReceipt result={data.result as ExperimentResult} />;
 		case "research":
 			return isSubagentFailure("research", data.result as ResearchResult) ? (
 				<ResearchBriefCard output={data.result} />

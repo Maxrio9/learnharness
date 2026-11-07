@@ -19,6 +19,7 @@ import { Reasoning, ReasoningContent, ReasoningTrigger } from "@/components/ai-e
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { BrailleSpinner } from "@/components/braille-spinner";
 import { LiveToolCard } from "@/components/artifacts/live-tool-card";
+import { ExperimentCard } from "@/components/artifacts/experiment-card";
 import { Separator } from "@/components/ui/separator";
 import { AnsweredCard } from "@/components/answered-card";
 import { MalformedQuestion } from "@/components/malformed-question";
@@ -1396,6 +1397,7 @@ export function Chat({
 						<PhaseChip phase={phases.at(-1) ?? "probe"} />
 					)}
 				</TopBar>
+				{(() => { const experiments=jobs.filter(job => job.kind === "experiment"); const pending=experiments.filter(job => job.status === "running" && job.experiment?.state === "awaiting_approval"); const latest=experiments[0]; const shown=pending.length ? pending : latest?.status === "error" && latest.experiment?.state === "revoked" ? [latest] : []; return shown.map(job => <div key={`pending-${job.id}:${job.experiment?.digest}`} className="max-h-[60vh] overflow-auto border-b px-3 pt-3"><div className="pb-3"><ExperimentCard job={job} /></div></div>); })()}
 
 				<SessionFind scopeRef={sessionFindScopeRef} scrollContextRef={scrollContextRef} />
 				<div ref={sessionFindScopeRef} className="relative flex min-h-0 flex-1">

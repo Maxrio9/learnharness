@@ -1,3 +1,4 @@
+import { ExperimentToolCard } from './experiment-card';
 import type { ComponentType } from "react";
 import type { ArtifactPartProps } from "@/src/core";
 import { DemoCard } from "@/components/artifacts/demo-card";
@@ -22,6 +23,7 @@ import { ProblemCard, ConcludeCard } from "@/components/practice-cards";
  */
 export const artifactRenderers: Record<string, ComponentType<ArtifactPartProps>> = {
 	research: JobCard,
+ experiment: ExperimentToolCard,
 	pdf: PdfJobCard, // sources v0 — live smoke 2026-09-19 caught the gap: without this the tool-pdf dispatch part rendered nothing
 	// plan_* parts render nothing inline by design: the phase seam is a
 	// message-level boundary, drawn by PhaseDivider in chat.tsx (the old

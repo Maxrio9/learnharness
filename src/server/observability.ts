@@ -76,7 +76,7 @@ export function activityFeed(): {
 	const jobs: ActivityJob[] = [];
 	for (const chat of chats) {
 		for (const job of listJobs(chat.id)) {
-			if (job.status === "running") {
+			if (job.status === "running" && !(job.kind === "experiment" && job.experiment?.state === "awaiting_approval")) {
 				jobs.push({
 					...job,
 					costUsd: jobCost(job),

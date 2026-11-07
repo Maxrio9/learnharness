@@ -20,6 +20,7 @@ import { BrailleSpinner } from "@/components/braille-spinner";
  *                 box must not duplicate it.
  */
 const KIND_LABEL: Record<JobKind, string> = {
+	experiment: "Experiment operator",
 	research: "Research agent",
 	demo: "Demo agent",
 	visual: "Figure agent",
@@ -29,7 +30,7 @@ const KIND_LABEL: Record<JobKind, string> = {
 export function DispatchCard({ toolCallId, kind }: { toolCallId: string; kind: JobKind }) {
 	const jobs = useContext(JobsContext);
 	const job = jobs.find((j) => j.toolCallId === toolCallId) ?? null;
-	const label = KIND_LABEL[kind];
+	const label = job?.kind === "research" && (job.input as {experimentPlanning?:boolean} | undefined)?.experimentPlanning ? "Experiment agent" : KIND_LABEL[kind];
 
 	if (!job || job.status === "running") {
 		return <DispatchActivityCard job={job} label={label} />;

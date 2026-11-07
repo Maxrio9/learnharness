@@ -1,3 +1,4 @@
+import {researchSourceFetch} from "./public-research-fetch.ts";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Type } from "typebox";
@@ -111,13 +112,13 @@ export function createPdfReadTools(dir: string): Record<string, AgentTool<any>> 
 					return `web_fetch_pdf failed: invalid URL "${url}"`;
 				}
 				try {
-					const resp = await fetch(url, {
+					const resp = await researchSourceFetch(url, {
 						headers: {
 							"User-Agent": USER_AGENT,
 							Accept: "application/pdf,application/octet-stream,*/*",
 						},
 						signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-					});
+					}, MAX_PDF_BYTES);
 					if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
 					const contentType = resp.headers.get("content-type") ?? "";
 					if (!/application\/pdf/i.test(contentType) && !/\.pdf(\?|$)/i.test(parsedPathname(url))) {

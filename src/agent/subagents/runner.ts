@@ -29,6 +29,7 @@ import type { ChatStore, JobStore } from "../../core/ports.ts";
 import { runDemoBuilder } from "./demo-builder.ts";
 import { runPdfReaderAgent } from "./pdf-reader.ts";
 import { runResearcherAgent } from "./researcher.ts";
+import { runExperimenter } from "./experimenter.ts";
 import { runVisualMaker } from "./visual-maker.ts";
 import { loadLearnerImage, type LearnerImage } from "../tools/learner-image.ts";
 
@@ -81,6 +82,8 @@ export interface JobRunnerDeps {
 	 *  EMPTY → undefined; runJob then refuses the spawn honestly instead
 	 *  of guessing a model. */
 	engineFor?: (role: ModelRole) => PiEngine | undefined;
+	/** Optional primary for the experiment specialist; normal researcher is fallback. */
+	experimentEngine?: () => PiEngine | undefined;
 	/** The search seam (search port wave, 2026-09-20): resolves the LIVE
 	 *  provider fresh per job — server/search.ts composition injected by
 	 *  the wiring; null = honestly unavailable (the researcher's web_search
@@ -115,16 +118,20 @@ interface LoopContext {
 	chatId?: string;
 	/** Fold one model call's usage into the job record (progress write). */
 	onUsage: (step: UsageStepLike) => void;
+	setModel: (engine: PiEngine) => void;
 }
 
 /** The kind→role table (model slots wave, 2026-09-20): which ModelRole's
  * engine each sub-agent kind runs — the engineFor injection key. */
-const KIND_ROLE: Record<JobKind, ModelRole> = {
+const KIND_ROLE: Record<Exclude<JobKind, "experiment">, ModelRole> = {
 	research: "researcher",
 	demo: "demoBuilder",
 	visual: "visualMaker",
 	pdf: "pdfReader",
 };
+
+/** The local model gets this long to produce a proposal; after that the configured researcher takes over. */
+const LOCAL_SPECIALIST_BUDGET_MS = 20 * 60 * 1000;
 
 export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 	const { chatStore, jobStore, deliver } = deps;
@@ -137,7 +144,7 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 		const chatId = jobStore.getJob(jobId)?.chatId;
 		// Provider-qualified stamp: the engine's actual model — the only
 		// thing that ran (BYOK: no config-pin fallback stamps exist).
-		const model = `${engine.model.provider}:${engine.model.id}`;
+		let model = `${engine.model.provider}:${engine.model.id}`;
 		// Real-kill wiring (2026-09 abort semantics): the controller is what
 		// the abort endpoint fires (agent/subagents/aborts.ts registry); the
 		// signal rides into every model call of the loop.
@@ -146,6 +153,7 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 		return {
 			abortSignal: controller.signal,
 			chatId,
+			setModel: (next) => { model = `${next.model.provider}:${next.model.id}`; },
 			onUsage: (step) => {
 				const next = accumulateJobUsage(usageTotals.get(jobId), model, step);
 				usageTotals.set(jobId, next);
@@ -169,7 +177,7 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 	 *  tests swap scripted engines without touching deps), then the injected
 	 *  settings-resolved engineFor. undefined = the BYOK chain came up
 	 *  empty (owner, 2026-09-22) — runJob refuses below, honestly. */
-	function pickEngine(kind: JobKind): PiEngine | undefined {
+	function pickEngine(kind: Exclude<JobKind, "experiment">): PiEngine | undefined {
 		const testOverride: Record<string, { current?: PiEngine } | undefined> = {
 			researcher: researchModelOverride,
 			demoBuilder: demoModelOverride,
@@ -180,7 +188,7 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 	}
 
 	const KIND_RUNNERS: Record<
-		JobKind,
+		Exclude<JobKind, "experiment">,
 		(jobId: string, engine: PiEngine, input: JobToolInput | undefined, loop: LoopContext) => Promise<void>
 	> = {
 		research: (jobId, engine, input, loop) => runResearchJob(jobId, engine, input, loop),
@@ -195,6 +203,7 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 			console.error(`[job ${jobId}] not found — nothing to run`);
 			return;
 		}
+		if (job.kind === "experiment") return; // Only one-use browser approval may launch the deterministic operator.
 		if (job.status !== "running") return; // already finished / re-run after crash recovery
 		const run = KIND_RUNNERS[job.kind];
 		if (!run) {
@@ -202,7 +211,10 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 			jobStore.updateJob(jobId, { status: "error", error: `unknown kind ${job.kind}`, activity: "failed" });
 			return;
 		}
-		const engine = pickEngine(job.kind);
+		const planning = job.kind === "research" && !!((input ?? job.input) as {experimentPlanning?:boolean} | undefined)?.experimentPlanning;
+		let engine:PiEngine|undefined;
+		try { engine = planning ? deps.experimentEngine?.() : undefined; } catch { /* local endpoint is unavailable */ }
+		if (!engine) { try { engine=pickEngine(job.kind); } catch { /* model unavailable */ } }
 		// The per-need refusal guards (BYOK 2026-09-22 / provider-key
 		// interlude 2026-09-25): no engine for the kind's tier, or the
 		// resolved engine's provider key gone — both refuse through the SAME
@@ -307,6 +319,7 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 		// Aborted mid-run (abortJob flips the record before
 		// the loop unwinds): no result write, no steer — the abort path owns
 		// the record and queues the abort steer itself.
+		if (job.kind === "experiment") return; // Only one-use browser approval may launch the deterministic operator.
 		if (job.status !== "running") return;
 		const failed = isSubagentFailure(job.kind, result);
 		jobStore.updateJob(jobId, {
@@ -350,6 +363,44 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 		if (!(typeof input?.question === "string" && input.question.trim())) {
 			jobStore.updateJob(jobId, { error: "research question unavailable" });
 			await finishJob(jobId, { brief: "Research failed: the research question is unavailable.", sources: [] });
+			return;
+		}
+		if ((input as ResearchToolInput & {experimentPlanning?:boolean}).experimentPlanning) {
+			try {
+				jobStore.updateJob(jobId, {activity:"planning experiment"});
+				const prompt=`Experimental question: ${input.question}\nContext: ${input.context ?? ""}`;
+				let primaryUsed=false;
+				const runWith = (engine: PiEngine, isPrimary=false) => { loop.setModel(engine); return runExperimenter(prompt, {engine, chatId:job.chatId, jobId, jobStore, signal:isPrimary?AbortSignal.any([loop.abortSignal,AbortSignal.timeout(LOCAL_SPECIALIST_BUDGET_MS)]):loop.abortSignal, search:deps.searchProvider, onUsage:(usage)=>{if(isPrimary && (usage.input || usage.output || usage.cacheRead || usage.cacheWrite))primaryUsed=true; if (!isPrimary || primaryUsed) loop.onUsage(piUsageToStep(usage));}, onToolStart:(name)=>jobStore.updateJob(jobId,{activity:`experiment: ${name}`})}); };
+				let primary:PiEngine|undefined;
+				try { primary=deps.experimentEngine?.(); } catch { /* fall back to configured researcher */ }
+				let brief:string;
+				if (primary) {
+					// An empty report from the local model (reasoning-only output, immediate stop) is a failed
+					// attempt, not a result: fall back to the configured researcher unless a proposal already exists.
+					let primaryEmpty=false;
+					try { brief=await runWith(primary,true); if (!brief.trim()) { primaryEmpty=true; throw new Error("local model returned no report"); } }
+					catch (error) {
+						// A local run that burned its turn budget or its wall-clock budget without a proposal is a failed attempt too.
+						const exhausted=error instanceof Error&&(/ran out of turns/.test(error.message)||(error.name==='AbortError'&&!loop.abortSignal.aborted));
+						if (loop.abortSignal.aborted || (primaryUsed && !primaryEmpty && !exhausted) || jobStore.findJobByToolCallId(job.chatId,`experiment-proposal-${jobId}`)) throw error;
+						jobStore.updateJob(jobId,{activity:'local model unavailable; using fallback'});
+						const fallback=pickEngine("research");
+						if (!fallback) throw new Error("Local model unavailable and fallback model is not configured");
+						const refusal=deps.providerKeyMissing?.(fallback.model.provider,ROLE_SLOT.researcher);
+						if (refusal) throw new Error(`Local model unavailable; fallback: ${refusal.error}`);
+						brief=await runWith(fallback);
+					}
+				} else brief=await runWith(model!);
+				if (!brief.trim()) throw new Error("experiment specialist produced no report");
+				const proposal=jobStore.findJobByToolCallId(job.chatId,`experiment-proposal-${jobId}`);
+				const status=proposal ? `Proposal ${proposal.id} was in state ${proposal.experiment?.state ?? "unknown"} when this report was written. That is a snapshot, not the current state: if the learner approves and it runs, a separate receipt message arrives later and supersedes this status.` : "No proposal was created and no experiment ran.";
+				await finishJob(jobId,{brief:`Experiment specialist report: ${status}\n\n${brief.trim()}`,sources:[]});
+			} catch (err) {
+				if (loop.abortSignal.aborted) return;
+				const reason=err instanceof Error?err.message:String(err);
+				jobStore.updateJob(jobId,{error:reason});
+				await finishJob(jobId,{brief:`Research failed: experiment specialist: ${reason}`,sources:[]});
+			}
 			return;
 		}
 		const question = input.question;

@@ -51,10 +51,10 @@ export function isJobLive(jobId: string): boolean {
 /** Abort a running job's loop. Returns false when no controller is live —
  * the job's loop is not executing. The endpoint separately refuses abort
  * for a finished worker, even while its session delivery remains pending. */
-export function fireJobAbort(jobId: string): boolean {
+export function fireJobAbort(jobId: string, retainUntilCleanup = false): boolean {
 	const controller = registry().get(jobId);
 	if (!controller) return false;
-	registry().delete(jobId);
+	if (!retainUntilCleanup) registry().delete(jobId);
 	controller.abort();
 	return true;
 }

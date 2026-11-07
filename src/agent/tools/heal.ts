@@ -32,6 +32,7 @@ export { healEncodedArguments };
  *  against the tool's declared schema. Spread-safe (these are plain
  *  object literals) and idempotent. */
 export function withArgumentHeal(tool: AgentTool<any>): AgentTool<any> {
+	if (tool.name === "experiment") return tool; // Approval-covered exact structured plans must never be healed.
 	const inner = tool.prepareArguments;
 	return {
 		...tool,

@@ -1,3 +1,4 @@
+import { experimentDispatchTool } from './tools/experiment-dispatch.ts';
 import { Type } from "typebox";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { invalidInputResult, questionResult, serverExecute } from "./tool-execute.ts";
@@ -462,6 +463,7 @@ export function createTeacherTools(
 			// only, always on — it shows the learner their own file.
 			show_image: createShowImageTool(ctx),
 			...planTools(ctx),
+			experiment: experimentDispatchTool(ctx),
 			...jobTools({ chatId: ctx.chatId, jobStore: ctx.jobStore, spawn: ctx.spawn, searchAvailable: ctx.searchAvailable }),
 		},
 		withoutMechanics(enabled),

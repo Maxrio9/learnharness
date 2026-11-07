@@ -77,7 +77,10 @@
 		"zod": "^4.4.3"
 	},
 	"overrides": {
-		"katex": "$katex"
+		"katex": "$katex",
+		"ansi-to-react": {
+			"linkify-it": "5.0.2"
+		}
 	},
 	"devDependencies": {
 		"@next/eslint-plugin-next": "^16.4.3",

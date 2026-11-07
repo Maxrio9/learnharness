@@ -1,5 +1,6 @@
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AUTH_FILE } from "../../../config.ts";
@@ -181,9 +182,10 @@ function checkedSourcePath(absolute: string, denied: (absolute: string) => boole
  *  These path checks are not protection against a hostile concurrent OS user. */
 export function resolveSourcePath(p?: string, policy?: ResolvedFileAccessPolicy): string {
 	const home = os.homedir();
-	const resolved = !p ? home : p === "~" || p.startsWith("~/") || p.startsWith(`~${path.sep}`)
+	const curriculumPath = resolveCurriculumPath(p);
+	const resolved = curriculumPath ?? (!p ? home : p === "~" || p.startsWith("~/") || p.startsWith(`~${path.sep}`)
 		? path.join(home, p.slice(1))
-		: path.resolve(home, p);
+		: path.resolve(home, p));
 	return guardSourcePath(checkedSourcePath(resolved, sourcePathCheck(home)), policy);
 }
 
@@ -201,6 +203,27 @@ export function sourceSearchRoots(p?: string, policy: ResolvedFileAccessPolicy =
 	if (protectedRoots) notices.push(`Skipped ${protectedRoots} protected allowed folder(s); sensitive-location denials cannot be overridden`);
 	if (!roots.length) throw new Error("Access denied: no accessible allowed folders. Add or repair folders in Settings → Agent → Tools → File access.");
 	return { roots, notices, multiRoot: true };
+}
+
+/** Apply the dedicated curriculum installation’s mandatory source scope. */
+function resolveCurriculumPath(p?: string): string | undefined {
+	const configured = process.env.LH_SOURCE_ROOTS;
+	if (configured === undefined) return undefined;
+	const raw: unknown = JSON.parse(configured);
+	if (!Array.isArray(raw) || raw.length === 0 || raw.some(r => typeof r !== "string" || !path.isAbsolute(r))) {
+		throw new Error("Invalid approved learning roots");
+	}
+	const roots = raw.map(r => realpathSync(r));
+	const candidate = p ? (path.isAbsolute(p) ? p : path.resolve(roots[0]!, p)) : roots[0]!;
+	const resolved = realpathSync(candidate);
+	if (!roots.some(r => resolved === r || resolved.startsWith(r + path.sep))) {
+		throw new Error("Outside approved learning scope");
+	}
+	const parts = [...candidate.split(path.sep), ...resolved.split(path.sep)];
+	if (parts.some(s => [".git", ".ssh", ".gnupg", "node_modules", ".venv", "build"].includes(s) || /^\.env(?:\.|$)/i.test(s) || /auth|credential|secret|token|password/i.test(s))) {
+		throw new Error("Sensitive or excluded learning path");
+	}
+	return resolved;
 }
 
 /** pi's formatSize idiom (50KB prints as "50.0KB"). */
@@ -306,7 +329,7 @@ export async function walkFiles(
 	const denied = sourcePathCheck();
 	// A caller may supply an alias of home as its root. Start from the real
 	// root and compare descendants against the same canonical protected roots.
-	const realRoot = guardSourcePath(checkedSourcePath(path.resolve(root), denied), options.policy);
+	const realRoot = guardSourcePath(checkedSourcePath(resolveCurriculumPath(root) ?? path.resolve(root), denied), options.policy);
 
 	const walkDir = async (dir: string): Promise<boolean> => {
 		if (Date.now() > deadline) {
@@ -333,6 +356,9 @@ export async function walkFiles(
 				return true;
 			}
 			const full = path.join(dir, entry.name);
+			if (process.env.LH_SOURCE_ROOTS !== undefined) {
+				try { resolveCurriculumPath(full); } catch { continue; }
+			}
 			if (entry.isDirectory()) {
 				if (EXCLUDED_DIR_NAMES.has(entry.name) || denied(full)) continue;
 				if (await walkDir(full)) return true;

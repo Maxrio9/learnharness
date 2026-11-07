@@ -69,7 +69,7 @@ export const lsTool: AgentTool<typeof lsInput> = {
 				break;
 			}
 			try {
-				const fullPath = policy.restricted ? resolveSourcePath(path.join(dirPath, entry), policy) : path.join(dirPath, entry);
+				const fullPath = (policy.restricted || process.env.LH_SOURCE_ROOTS !== undefined) ? resolveSourcePath(path.join(dirPath, entry), policy) : path.join(dirPath, entry);
 				const entryStat = await fs.stat(fullPath);
 				lines.push(entryStat.isDirectory() ? `${entry}/` : entry);
 			} catch {
