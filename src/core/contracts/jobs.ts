@@ -17,7 +17,7 @@ export type JobKind = "research" | "demo" | "visual" | "pdf" | "experiment";
 export type JobStatus = "running" | "done" | "error";
 
 export interface JobRecord {
- experiment?: {state:"awaiting_approval"|"consumed"|"finished"|"revoked";digest:string;expiresAt:number};
+ experiment?: {state:"awaiting_approval"|"consumed"|"finished"|"revoked";digest:string;expiresAt:number;/** Set on an attempt that runs inside another proposal's approval envelope. */parentJobId?:string};
 	id: string;
 	kind: JobKind;
 	chatId: string;

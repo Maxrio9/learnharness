@@ -9,6 +9,10 @@ export interface ExperimentPlan {
  environments?:{name:string;wheels:string[];maxInstalledMiB:number}[];
  model?:{repo:string;revision:string;files:{name:string;sha256:string;bytes:number}[]};
  network:'off'|'internal-loopback';gpu:boolean;
+ /** Approval envelope (v3 only): after a failed attempt the agent may submit corrected attempts without a new approval,
+  *  as long as every attempt reuses exactly this plan's downloads, environments, model, GPU and network mode, stays
+  *  within its limits, and the number of attempts and their total wall time stay within this budget. */
+ adaptive?:{attempts:number;totalWallSeconds:number};
 }
 export type { ExperimentResult } from "../../core/contracts/experiment.ts";
 export const GPU_GAP = 'GPU unsupported: reviewed experiment_guard.py owns a native child session/process group; systemd-run starts a service outside that process tree/session. Cgroup PID registration, lease preemption and cleanup of the owned service are not qualified. No devices exposed; a reviewed guard-to-owned-systemd-cgroup adapter is required.';
@@ -31,7 +35,8 @@ export function parsePlan(value:unknown):ExperimentPlan {
  const version=(value as {version?:unknown}|null)?.version;
  const v3=version===3, v2=version===2||v3;
  const model=v3&&value!==null&&typeof value==='object'&&Object.hasOwn(value,'model');
- const p=object(value,['version','title','purpose','commands','downloads','inputs','limits','network','gpu',...(v2?['exports']:[]),...(v3?['environments']:[]),...(model?['model']:[])]);
+ const adaptive=v3&&value!==null&&typeof value==='object'&&Object.hasOwn(value,'adaptive');
+ const p=object(value,['version','title','purpose','commands','downloads','inputs','limits','network','gpu',...(v2?['exports']:[]),...(v3?['environments']:[]),...(model?['model']:[]),...(adaptive?['adaptive']:[])]);
  if((version!==1&&version!==2&&version!==3) || typeof p.network!=='string' || !['off','internal-loopback'].includes(p.network)||typeof p.gpu!=='boolean') throw new Error('Unsupported plan');
  const commands=array(p.commands,16).map(c=>{const a=array(c,64).map(s=>str(s,8192));if(!a.length)throw new Error('Empty argv');return a;});
  if(!commands.length)throw new Error('Commands required');
@@ -62,6 +67,11 @@ export function parsePlan(value:unknown):ExperimentPlan {
   if(new Set(out.environments.map(e=>e.name)).size!==out.environments.length||out.environments.reduce((n,e)=>n+e.maxInstalledMiB,0)>65536)throw new Error('Duplicate environments or excessive installation bound');
  }
  if(model)out.model=parseModelSelection(p.model);
+ if(adaptive){
+  const a=object(p.adaptive,['attempts','totalWallSeconds']);
+  out.adaptive={attempts:int(a.attempts,2,6),totalWallSeconds:int(a.totalWallSeconds,60,14400)};
+  if(out.adaptive.totalWallSeconds<limits.wallSeconds)throw new Error('Adaptive total time must cover one attempt');
+ }
  if(Buffer.byteLength(JSON.stringify(out))>(v3?163840:65536))throw new Error('Plan too large');
  return out;
 }
@@ -76,6 +86,8 @@ export function receiptArtifacts(plan:ExperimentPlan,value:unknown):{name:string
  if(new Set(artifacts.map(a=>a.name)).size!==artifacts.length||artifacts.reduce((n,a)=>n+a.bytes,0)>(plan.limits.artifactBytes??0))throw Error('Excessive receipt artifacts');
  return artifacts;
 }
+/** The plan exactly as a single sandbox run sees it: the supervisor knows nothing about the approval envelope. */
+export function stripAdaptive(plan:ExperimentPlan):ExperimentPlan {const {adaptive:_ignored,...rest}=plan;return rest as ExperimentPlan;}
 export function canonicalPlan(p:unknown):string { return JSON.stringify(parsePlan(p)); }
 export function planDigest(p:unknown):string {return createHash('sha256').update(canonicalPlan(p)).digest('hex');}
 /** Positive browser evidence, in addition to app capability and private learner identity.

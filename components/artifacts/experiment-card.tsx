@@ -1,6 +1,6 @@
 "use client";
 import { useContext, useEffect, useState, type ReactNode } from "react";
-import { Boxes, ChevronDown, Clock3, Cpu, Database, Download, FileDown, FlaskConical, Play, RotateCcw, WifiOff } from "lucide-react";
+import { Boxes, ChevronDown, Clock3, Cpu, Database, Download, FileDown, FlaskConical, Play, RotateCcw, WifiOff, RotateCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { BrailleSpinner } from "@/components/braille-spinner";
 import { DispatchCard } from "@/components/artifacts/dispatch-card";
@@ -87,6 +87,13 @@ export function allowances(plan: ExperimentPlan): Allowance[] {
 		lead: `Run ${commands === 1 ? "one command" : `${commands} commands`}${plan.gpu ? " on the desktop GPU" : ""}`,
 		rest: `in a sandbox, up to ${durationLabel(plan.limits.wallSeconds)} and ${memoryLabel(plan.limits.memoryMiB)} of RAM`,
 	});
+	if (plan.adaptive) {
+		rows.push({
+			icon: RotateCw,
+			lead: `Fix and retry if it fails, up to ${plan.adaptive.attempts} attempts`,
+			rest: `${durationLabel(plan.adaptive.totalWallSeconds)} of sandbox time in total. Retries keep the same downloads, environments and model, and can only lower the limits above`,
+		});
+	}
 	if (plan.model) {
 		rows.push({ icon: Database, lead: "Read a cached model", rest: `${plan.model.repo}, read-only` });
 	}
@@ -194,7 +201,7 @@ export function ExperimentCard({ job }: { job: JobRecord }) {
 						))}
 					</ul>
 					<p className="mt-3 text-xs leading-relaxed text-muted-foreground">
-						It cannot see your files or credentials, and nothing else runs. The approval covers this exact plan, once.
+						It cannot see your files or credentials, and nothing outside this list runs. The approval is for this plan and its listed limits, once; the agent may correct its own commands within them but cannot add downloads, network or more resources.
 					</p>
 				</div>
 			)}

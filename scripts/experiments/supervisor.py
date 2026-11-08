@@ -350,8 +350,6 @@ def bwrap_args(plan,inputs,workspace_bytes=None,environments=(),runtime_root=Non
         args += ['--dir','/workspace/shm','--symlink','/workspace/shm','/dev/shm','--dir','/environments','--dir','/tools']
         probe = pathlib.Path(__file__).with_name('serving_probe.py').resolve()
         args += ['--ro-bind',str(probe),'/tools/serving_probe.py']
-        ladder = pathlib.Path(__file__).with_name('engine_ladder.py').resolve()
-        args += ['--ro-bind',str(ladder),'/tools/engine_ladder.py']
         if runtime_root:
             args += ['--dir','/opt','--ro-bind',str(runtime_root),'/opt/lh-python',
                      '--size','4096','--tmpfs','/opt/lh-python/lib/python3.12/site-packages',

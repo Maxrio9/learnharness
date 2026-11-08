@@ -81,7 +81,7 @@ export function listModelLocks():NonNullable<ExperimentPlan['model']>[] {
 }
 
 export function expandEnvironmentLocks(draft:unknown,refs:LockedEnvironmentRef[]):ExperimentPlan {
- if(!draft||typeof draft!=='object'||Array.isArray(draft)||!['commands,exports,gpu,inputs,limits,network,purpose,title,version','commands,exports,gpu,inputs,limits,model,network,purpose,title,version'].includes(Object.keys(draft).sort().join(','))||(draft as {version?:unknown}).version!==3)throw Error('Exact v3 locked plan required');
+ if(!draft||typeof draft!=='object'||Array.isArray(draft)||!['commands,exports,gpu,inputs,limits,network,purpose,title,version','commands,exports,gpu,inputs,limits,model,network,purpose,title,version','adaptive,commands,exports,gpu,inputs,limits,network,purpose,title,version','adaptive,commands,exports,gpu,inputs,limits,model,network,purpose,title,version'].includes(Object.keys(draft).sort().join(','))||(draft as {version?:unknown}).version!==3)throw Error('Exact v3 locked plan required');
  if(!Array.isArray(refs)||refs.length<1||refs.length>4)throw Error('Select one to four environment locks');
  const wheels=new Map<string,Download>();
  const environments=refs.map(ref=>{

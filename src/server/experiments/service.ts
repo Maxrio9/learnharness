@@ -8,9 +8,9 @@ import { homedir, cpus } from 'node:os';
 import { createHash } from 'node:crypto';
 import { PATHS, ROOT } from '../../../config.ts';
 import { jobStore } from '../../store/jobs.ts';
-import { registerJobAbort, unregisterJobAbort, isJobLive } from '../../agent/subagents/aborts.ts';
+import { registerJobAbort, unregisterJobAbort, isJobLive, fireJobAbort } from '../../agent/subagents/aborts.ts';
 import { buildSubagentSteer, buildAbortSteer, type JobRecord } from '../../core/contracts/jobs.ts';
-import { canonicalPlan, parsePlan, planDigest, receiptArtifacts, GPU_GAP, type ExperimentResult } from './plan.ts';
+import { canonicalPlan, parsePlan, planDigest, receiptArtifacts, stripAdaptive, GPU_GAP, type ExperimentPlan, type ExperimentResult } from './plan.ts';
 const admin=path.join(PATHS.data,'admin','experiments');
 const receiptBound=(input:unknown)=>(input as {version?:unknown}|null)?.version===3?524288:262144;
 const safeId=(id:string)=>{if(!/^job_[A-Za-z0-9_-]{1,100}$/.test(id))throw new Error('Invalid experiment identity');return id;};
@@ -178,7 +178,8 @@ export function receiptHasCleanupProof(receipt:Record<string,unknown>):boolean {
 export function validateSupervisorReceipt(plan:ReturnType<typeof parsePlan>,id:string,value:unknown):Record<string,unknown> {
  if(!value||typeof value!=='object'||Array.isArray(value))throw Error('Invalid supervisor receipt');
  const r=value as Record<string,unknown>;
- if(r.jobId!==id||r.planDigest!==planDigest(plan)||planDigest(r.plan)!==planDigest(plan)||r.phase!=='terminal'||!['done','error','cancelled','timeout','output_limit','deferred'].includes(String(r.outcome))||!r.cleanup||typeof r.cleanup!=='object'||typeof (r.cleanup as {empty?:unknown}).empty!=='boolean'||(r.outcome==='done'&&r.exitCode!==0))throw Error('Invalid supervisor receipt');
+ const ran=stripAdaptive(plan); // the supervisor only ever sees the plan without its approval envelope
+ if(r.jobId!==id||r.planDigest!==planDigest(ran)||planDigest(r.plan)!==planDigest(ran)||r.phase!=='terminal'||!['done','error','cancelled','timeout','output_limit','deferred'].includes(String(r.outcome))||!r.cleanup||typeof r.cleanup!=='object'||typeof (r.cleanup as {empty?:unknown}).empty!=='boolean'||(r.outcome==='done'&&r.exitCode!==0))throw Error('Invalid supervisor receipt');
  receiptArtifacts(plan,r.artifacts);
  const environments=receiptEnvironments(plan,r.environments);
  if(r.outcome==='done'&&environments.length!==(plan.environments?.length??0))throw Error('Missing approved environment receipt');
@@ -226,7 +227,7 @@ export async function redeliverReceipt(jobId:string):Promise<{steerId:string}> {
  await deliverJobResult(steer);
  return {steerId};
 }
-async function finish(job:JobRecord,receipt:Record<string,unknown>):Promise<void> {
+async function finish(job:JobRecord,receipt:Record<string,unknown>,opts:{adapt?:boolean}={}):Promise<(()=>Promise<void>)|void> {
  const current=jobStore.getJob(job.id);
  const aborted=current?.experiment?.state==='revoked';
  if(aborted)receipt={...receipt,operatorOutcome:receipt.outcome,outcome:'cancelled'};
@@ -237,12 +238,27 @@ async function finish(job:JobRecord,receipt:Record<string,unknown>):Promise<void
  const result:ExperimentResult={receiptId:job.id,outcome:String(receipt.outcome),summary:boundedText(receipt.error??receipt.stdout??receipt.outcome,4096),artifacts:receiptArtifacts(plan,receipt.artifacts),...(plan.version===3?{environments:receiptEnvironments(plan,receipt.environments)}:{})};
  // The tutor teaches from this: run facts plus a bounded, free-text-free digest of exported JSON measurements.
  try {result.evidence=evidenceFor(job.id,result.artifacts);}catch{/* the receipt summary alone still reaches the tutor */}
+ const parentId=current.experiment?.parentJobId;
+ if(parentId){
+  // An attempt inside another proposal's approval envelope settles quietly: the learner's lesson hears about the
+  // experiment once, from the session, not about every intermediate failure.
+  jobStore.updateJob(job.id,{result,status:result.outcome==='done'?'done':'error',error:result.outcome==='done'?undefined:result.summary,activity:'receipt ready',experiment:{...current.experiment!,state:current.experiment!.state==='revoked'?'revoked':'finished'}});
+  return ()=>continueSession(parentId,job.id,result,aborted);
+ }
+ if(opts.adapt&&plan.adaptive&&!aborted&&result.outcome!=='done'){
+  // The first attempt failed inside an approval envelope: keep the job open and let the session adjust.
+  jobStore.updateJob(job.id,{activity:`attempt 1 ended (${result.outcome}) — agent is adjusting`});
+  return ()=>continueSession(job.id,job.id,result,false);
+ }
  jobStore.updateJob(job.id,{result,status:result.outcome==='done'?'done':'error',error:result.outcome==='done'?undefined:result.summary,activity:'receipt ready',experiment:current.experiment?{...current.experiment,state:current.experiment.state==='revoked'?'revoked':'finished'}:undefined,delivery:{kind:aborted?'abort':'result',status:'pending'}});
  const { deliverJobResult }=await import('../jobs.ts');
  void deliverJobResult(aborted?buildAbortSteer(job):buildSubagentSteer(job,result)).catch(()=>undefined);
 }
+
 async function runApproved(job:JobRecord,canonical:string,controller:AbortController):Promise<void> {
  const plan=parsePlan(JSON.parse(canonical));
+ const runPlan=stripAdaptive(plan);
+ let next:(()=>Promise<void>)|void;
  try {
   if(plan.gpu&&plan.version===1){await finish(job,{jobId:job.id,plan,planDigest:planDigest(plan),outcome:'error',error:GPU_GAP,start:Date.now(),end:Date.now(),cleanup:{launched:false,empty:true}});return;}
   const receipt=await new Promise<Record<string,unknown>>((resolve,reject)=>{
@@ -254,21 +270,22 @@ async function runApproved(job:JobRecord,canonical:string,controller:AbortContro
    // Independent cgroup cleanup even if trusted Python hangs in DNS/TLS.
    const hard=setTimeout(()=>{void killOwned(job.id).finally(()=>child.kill('SIGKILL'));},(plan.limits.wallSeconds+15)*1000);
    child.stdout.on('data',(data:Buffer)=>{bytes+=data.length;if(bytes>bound){stop();return;}out=Buffer.concat([out,data]);});
-   child.stderr.on('data',(data:Buffer)=>{bytes+=data.length;if(bytes>bound)stop();if(data.toString('utf8').includes('LH_EXPERIMENT_PHASE:running')&&jobStore.getJob(job.id)?.experiment?.state==='consumed')jobStore.updateJob(job.id,{activity:plan.gpu?'running approved GPU sandbox':'running approved CPU sandbox'});});
+   child.stderr.on('data',(data:Buffer)=>{bytes+=data.length;if(bytes>bound)stop();if(data.toString('utf8').includes('LH_EXPERIMENT_PHASE:running')&&jobStore.getJob(job.id)?.experiment?.state==='consumed'){const text=plan.gpu?'running approved GPU sandbox':'running approved CPU sandbox';jobStore.updateJob(job.id,{activity:text});const owner=jobStore.getJob(job.id)?.experiment?.parentJobId;if(owner)jobStore.updateJob(owner,{activity:`attempt running — ${text}`});}});
    child.on('error',reject);
    child.stdin.on('error',()=>undefined);
    child.on('close',()=>{
     clearTimeout(timer);clearTimeout(hard);if(abortHard)clearTimeout(abortHard);controller.signal.removeEventListener('abort',stop);
     try {resolve(validateSupervisorReceipt(plan,job.id,JSON.parse(out.toString('utf8'))));}catch{reject(new Error('Supervisor ended without a valid receipt'));}
    });
-   child.stdin.end(JSON.stringify({jobId:job.id,plan,digest:planDigest(plan),admin}));
+   child.stdin.end(JSON.stringify({jobId:job.id,plan:runPlan,digest:planDigest(runPlan),admin}));
    if(controller.signal.aborted)stop();
   });
-  await finish(job,receipt);
+  next=await finish(job,receipt,{adapt:true});
  } catch {
   const valid=recoveryEvidence(job),stopped=await stopInterrupted(job,valid);
-  await finish(job,valid&&stopped===valid.cleanup?valid:{jobId:job.id,plan,planDigest:planDigest(plan),outcome:'error',error:'Supervisor failed; new proposal required',end:Date.now(),cleanup:stopped});
+  next=await finish(job,valid&&stopped===valid.cleanup?valid:{jobId:job.id,plan,planDigest:planDigest(plan),outcome:'error',error:'Supervisor failed; new proposal required',end:Date.now(),cleanup:stopped},{adapt:true});
  } finally {unregisterJobAbort(job.id);}
+ if(next)await next();
 }
 /** Restart recovery never reuses a consumed grant. Awaiting proposals remain inert. */
 export async function recoverExperiment(job:JobRecord):Promise<void> {
@@ -281,4 +298,132 @@ export async function recoverExperiment(job:JobRecord):Promise<void> {
   let prior:Record<string,unknown>={};try{prior=readReceipt(job.id) as Record<string,unknown>;}catch{/* no receipt survived */}
   await finish(job,{...prior,interruptedOutcome:prior.outcome,jobId:job.id,plan:job.input,planDigest:job.experiment?.digest,outcome:'error',error:'Interrupted experiment; approval consumed. New proposal and approval required.',end:Date.now(),cleanup:stopped});
  }finally{unregisterJobAbort(job.id);}
+}
+
+// ── Approval envelope: adaptive attempts ───────────────────────────────────────────────────────────────────────
+// One approval covers a bounded envelope (downloads, environments, model, GPU, network, limits, attempt count and
+// total time). The approved commands run first, exactly as reviewed. If they fail, an agent may submit corrected
+// attempts that reuse exactly the approved capabilities and stay within the approved limits; nothing outside the
+// envelope can be added without a new approval. Each attempt is an ordinary sandboxed run with its own receipt.
+export interface AttemptView {n:number;jobId:string;outcome:string;seconds:number;tail:string;commands:string[][]}
+export interface AdapterRequest {parent:JobRecord;attempts:AttemptView[];remaining:{attempts:number;wallSeconds:number}}
+export interface AdapterVerdict {note:string}
+type Adapter=(request:AdapterRequest,signal:AbortSignal)=>Promise<AdapterVerdict>;
+let adapter:Adapter|undefined;
+/** Registered once by the composition root; it owns the model that diagnoses a failed attempt. */
+export function setExperimentAdapter(fn:Adapter|undefined):void {adapter=fn;}
+interface Session {controller:AbortController;active?:string;chain:Promise<unknown>}
+const sessions=new Map<string,Session>();
+const childrenOf=(parent:JobRecord)=>jobStore.listJobs(parent.chatId).filter(j=>j.kind==='experiment'&&j.experiment?.parentJobId===parent.id).sort((a,b)=>a.createdAt.localeCompare(b.createdAt)||a.id.localeCompare(b.id));
+function receiptSeconds(id:string):number {
+ try {const r=rawReceipt(id) as {start?:unknown;end?:unknown};const a=Date.parse(String(r.start)),b=Date.parse(String(r.end));return Number.isFinite(a)&&Number.isFinite(b)?Math.max(0,(b-a)/1000):0;}catch{return 0;}
+}
+const clip=(text:string,head:number,tail:number)=>text.length>head+tail+40?`${text.slice(0,head)}\n…[${text.length-head-tail} chars omitted]…\n${text.slice(-tail)}`:text;
+/** What a failed attempt printed, bounded and redacted. UNTRUSTED data for the adjusting agent. */
+export function attemptEvidence(id:string):{outcome:string;seconds:number;tail:string} {
+ try {
+  const r=readReceipt(id) as Record<string,unknown>;
+  const text=(v:unknown)=>typeof v==='string'?v:'';
+  const parts=[`outcome ${String(r.outcome)}, exit code ${r.exitCode===null||r.exitCode===undefined?'unknown':String(r.exitCode)}`];
+  if(r.error)parts.push(`error: ${boundedText(r.error,300)}`);
+  if(text(r.stdout))parts.push(`stdout:\n${clip(text(r.stdout),600,3000)}`);
+  if(text(r.stderr))parts.push(`stderr:\n${clip(text(r.stderr),300,1200)}`);
+  return {outcome:String(r.outcome),seconds:receiptSeconds(id),tail:parts.join('\n')};
+ }catch{return {outcome:'unknown',seconds:0,tail:'receipt unavailable'};}
+}
+function attemptViews(parent:JobRecord):AttemptView[] {
+ return [parent,...childrenOf(parent)].map((j,i)=>({n:i+1,jobId:j.id,...attemptEvidence(j.id),commands:parsePlan(j.input).commands}));
+}
+const historyText=(views:AttemptView[],note:string)=>views.length<2&&!note?'':`Attempts inside the learner's single approval (the agent adjusted the commands after failures; every attempt had the same approved downloads, environments, GPU and limits):\n${views.map(v=>`- attempt ${v.n}: ${v.outcome} after ${Math.round(v.seconds)} s`).join('\n')}${note?`\nSession note: ${note}`:''}`;
+function grantTime(id:string):number|undefined {
+ try {const g=JSON.parse(fs.readFileSync(path.join(admin,'grants',safeId(id)+'.json'),'utf8'));return typeof g.approvedAt==='number'?g.approvedAt:undefined;}catch{return undefined;}
+}
+export interface AttemptPatch {commands:string[][];exports?:{path:string;maxBytes:number}[];limits?:Record<string,number>;title?:string}
+/** Start the next attempt of an open session. Only valid while the server holds the session open after a failure. */
+export function startAttempt(parentId:string,patch:AttemptPatch):{jobId:string;n:number} {
+ safeId(parentId);
+ const parent=jobStore.getJob(parentId);const session=sessions.get(parentId);
+ if(!parent||parent.kind!=='experiment'||parent.status!=='running'||parent.experiment?.state==='revoked'||!session||session.active||session.controller.signal.aborted)throw new Error('No adjustment is open for this experiment');
+ const approved=parsePlan(parent.input);
+ if(!approved.adaptive)throw new Error('This approval does not allow further attempts');
+ const kids=childrenOf(parent);const used=1+kids.length;
+ if(used>=approved.adaptive.attempts)throw new Error(`All ${approved.adaptive.attempts} approved attempts are used`);
+ const spent=[parent,...kids].reduce((n,j)=>n+receiptSeconds(j.id),0);
+ const left=Math.floor(approved.adaptive.totalWallSeconds-spent);
+ if(left<60)throw new Error('The approved time budget is used up');
+ const run=structuredClone(stripAdaptive(approved)) as ExperimentPlan;
+ run.commands=patch.commands;
+ run.title=(patch.title??`${approved.title} (attempt ${used+1})`).slice(0,160);
+ for(const [key,value] of Object.entries(patch.limits??{})){
+  const cap=(approved.limits as unknown as Record<string,number|undefined>)[key];
+  if(cap===undefined)throw new Error(`Unknown limit ${key}`);
+  if(!Number.isSafeInteger(value)||value<1||value>cap)throw new Error(`limits.${key} cannot exceed the approved ${cap}`);
+  (run.limits as unknown as Record<string,number>)[key]=value;
+ }
+ run.limits.wallSeconds=Math.min(run.limits.wallSeconds,left);
+ if(patch.exports)run.exports=patch.exports;
+ const derived=parsePlan(run); // same strict parser, same bounds as any proposal
+ const n=used+1;const toolCallId=`attempt-${parentId}-${n}`;
+ if(jobStore.findJobByToolCallId(parent.chatId,toolCallId))throw new Error('This attempt already exists');
+ area();
+ const child=jobStore.createJob({kind:'experiment',chatId:parent.chatId,toolCallId,input:derived,activity:`attempt ${n} — preparing`});
+ const digest=planDigest(derived);
+ jobStore.updateJob(child.id,{experiment:{state:'consumed',digest,expiresAt:Date.now(),parentJobId:parentId}});
+ const grant=fs.openSync(path.join(admin,'grants',child.id+'.json'),'wx',0o600);
+ try{fs.writeFileSync(grant,JSON.stringify({jobId:child.id,chatId:parent.chatId,digest,source:'approval-envelope:'+parentId,approvedAt:grantTime(parentId)??Date.now(),consumedAt:Date.now(),expiresAt:Date.now()}));fs.fsyncSync(grant);}finally{fs.closeSync(grant);}
+ syncDirectory(path.join(admin,'grants'));
+ session.active=child.id;
+ const controller=new AbortController();registerJobAbort(child.id,controller);
+ jobStore.updateJob(parentId,{activity:`attempt ${n} of ${approved.adaptive.attempts} — preparing`});
+ void runApproved(jobStore.getJob(child.id)!,canonicalPlan(derived),controller).catch(()=>{jobStore.updateJob(child.id,{error:'Attempt evidence persistence failed',activity:'recovery required'});});
+ return {jobId:child.id,n};
+}
+function openSession(parentId:string):Session {
+ let session=sessions.get(parentId);
+ if(session)return session;
+ session={controller:new AbortController(),chain:Promise.resolve()};sessions.set(parentId,session);
+ registerJobAbort(parentId,session.controller);
+ const owned=session;
+ session.controller.signal.addEventListener('abort',()=>{
+  const id=owned.active;if(!id)return;
+  const child=jobStore.getJob(id);
+  if(child?.experiment)jobStore.updateJob(id,{experiment:{...child.experiment,state:'revoked'}});
+  fireJobAbort(id,true);
+ },{once:true});
+ return session;
+}
+/** Serialised per session: an attempt's result and the agent's adjustment never interleave. */
+function continueSession(parentId:string,lastId:string,last:ExperimentResult,aborted:boolean):Promise<void> {
+ const session=openSession(parentId);
+ const step=async()=>{
+  session.active=undefined;
+  const parent=jobStore.getJob(parentId);if(!parent||parent.status!=='running')return;
+  const approved=parsePlan(parent.input);const budget=approved.adaptive!;
+  const kids=childrenOf(parent);const used=1+kids.length;
+  const left=Math.floor(budget.totalWallSeconds-[parent,...kids].reduce((n,j)=>n+receiptSeconds(j.id),0));
+  const stop=aborted||session.controller.signal.aborted||parent.experiment?.state==='revoked';
+  if(stop||last.outcome==='done'||used>=budget.attempts||left<60||!adapter){
+   return settleSession(parentId,lastId,last,stop?'':last.outcome==='done'?'':used>=budget.attempts?'All approved attempts were used.':left<60?'The approved time budget was used up.':'No adjusting agent was available.',stop);
+  }
+  jobStore.updateJob(parentId,{activity:`attempt ${used} ended (${last.outcome}) — agent is adjusting (${budget.attempts-used} attempt(s) left)`});
+  let note='';
+  try {note=(await adapter({parent:jobStore.getJob(parentId)!,attempts:attemptViews(parent),remaining:{attempts:budget.attempts-used,wallSeconds:left}},session.controller.signal)).note;}
+  catch(error){note=`The adjusting agent failed: ${String(error instanceof Error?error.message:error).slice(0,200)}`;}
+  if(session.active)return; // an attempt is running; its receipt continues the session
+  return settleSession(parentId,lastId,last,note||'The agent made no further attempt.',session.controller.signal.aborted);
+ };
+ session.chain=session.chain.then(step,step);
+ return session.chain as Promise<void>;
+}
+async function settleSession(parentId:string,lastId:string,last:ExperimentResult,note:string,cancelled=false):Promise<void> {
+ const parent=jobStore.getJob(parentId);
+ sessions.delete(parentId);unregisterJobAbort(parentId);
+ if(!parent||parent.status!=='running')return;
+ const history=historyText(attemptViews(parent),note);
+ const result:ExperimentResult={...last,receiptId:lastId,evidence:[history,last.evidence].filter(Boolean).join('\n')||undefined};
+ const revoked=cancelled||parent.experiment?.state==='revoked';
+ jobStore.updateJob(parentId,{result,status:last.outcome==='done'&&!revoked?'done':'error',error:last.outcome==='done'&&!revoked?undefined:last.summary,activity:'receipt ready',experiment:parent.experiment?{...parent.experiment,state:revoked?'revoked':'finished'}:undefined,delivery:{kind:revoked?'abort':'result',status:'pending'}});
+ const { deliverJobResult }=await import('../jobs.ts');
+ const fresh=jobStore.getJob(parentId)!;
+ void deliverJobResult(revoked?buildAbortSteer(fresh):buildSubagentSteer(fresh,result)).catch(()=>undefined);
 }

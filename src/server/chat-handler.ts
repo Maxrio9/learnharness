@@ -34,6 +34,8 @@ import { collectToolCallIds } from "./pi/call-ids.ts";
 import { providerEventNote } from "../agent/provider-events.ts";
 import { effectiveSettings, stores } from "./stores.ts";
 import { searchAvailable, searchProvider } from "./search.ts";
+import { runAttemptDriver } from "../agent/subagents/experimenter.ts";
+import { setExperimentAdapter } from "./experiments/service.ts";
 import { providerKeyPresent } from "./keys.ts";
 import { CLAUDE_CODE_PROVIDER } from "../core/contracts/claude-code.ts";
 import {
@@ -94,6 +96,17 @@ function settlementErrorText(error: unknown): string {
 	return error instanceof TurnPersistenceError ? error.message : "An error occurred.";
 }
 
+/** The experiment specialist is interactive work the learner is waiting on, so it uses the FOREGROUND endpoint (LH_EXPERIMENT_LOCAL_BASE_URL); a background endpoint would defer it behind other jobs. */
+const experimentEngine = (): PiEngine | undefined => {
+	const cp=stores.settingsStore.readSettings()?.customProvider;
+	const localBase = process.env.LH_EXPERIMENT_LOCAL_BASE_URL;
+	if (!localBase || cp?.baseUrl !== localBase || !cp.models?.some(m=>m.id === "local")) return undefined;
+	// Local thinking is slow (~55 tokens/s): default to low. LH_EXPERIMENT_THINKING = minimal | low | medium | high.
+	const requested = process.env.LH_EXPERIMENT_THINKING;
+	const thinkingLevel = (["minimal", "low", "medium", "high"] as const).find((level) => level === requested) ?? "low";
+	return piEngineForSpec({provider:"custom",id:"local",thinkingLevel}, true);
+};
+
 const jobRunner = createJobRunner({
 	chatStore: stores.chatStore,
 	jobStore: stores.jobStore,
@@ -107,16 +120,8 @@ const jobRunner = createJobRunner({
 	// This dedicated inference curriculum uses the configured local Spark broker.
 	// Do not redirect an arbitrary custom endpoint or change the research role.
 	// The experiment specialist is interactive work the learner is waiting on, so it uses the
-	// FOREGROUND endpoint (set LH_EXPERIMENT_LOCAL_BASE_URL to it); a background endpoint would defer it behind other jobs.
-	experimentEngine: () => {
-		const cp=stores.settingsStore.readSettings()?.customProvider;
-		const localBase = process.env.LH_EXPERIMENT_LOCAL_BASE_URL;
-		if (!localBase || cp?.baseUrl !== localBase || !cp.models?.some(m=>m.id === "local")) return undefined;
-		// Local thinking is slow (~55 tokens/s): default to low. LH_EXPERIMENT_THINKING = minimal | low | medium | high.
-		const requested = process.env.LH_EXPERIMENT_THINKING;
-		const thinkingLevel = (["minimal", "low", "medium", "high"] as const).find((level) => level === requested) ?? "low";
-		return piEngineForSpec({provider:"custom",id:"local",thinkingLevel}, true);
-	},
+	// FOREGROUND broker (8891); the background broker (8892) defers it behind other background jobs.
+	experimentEngine,
 	// Key-presence gate (provider-key interlude, 2026-09-25): the runner
 	// reads the resolved engine's provider and asks THIS check (the agent
 	// layer may not read the key store); a missing key refuses the spawn
@@ -128,6 +133,23 @@ const jobRunner = createJobRunner({
 	// null = honestly unavailable; the dispatch-level drop (below) uses the
 	// same signal so keyless servers never see the research tool at all.
 	searchProvider,
+});
+
+/** After a failed experiment attempt the specialist may correct it inside the learner's single approval. The local model
+ *  goes first; if it fails or is unavailable the configured researcher engine takes over. The experiment service
+ *  re-validates every attempt against the approved envelope, so this can only ever act within it. */
+setExperimentAdapter(async (request, signal) => {
+	const attempt = async (engine: PiEngine, local: boolean) => runAttemptDriver(request, {
+		engine, search: searchProvider,
+		signal: local ? AbortSignal.any([signal, AbortSignal.timeout(900_000)]) : signal,
+		onToolStart: (name) => stores.jobStore.updateJob(request.parent.id, { activity: `agent adjusting: ${name}` }),
+	});
+	let primary: PiEngine | undefined;
+	try { primary = experimentEngine(); } catch { /* local endpoint unavailable */ }
+	if (primary) { try { return await attempt(primary, true); } catch (error) { if (signal.aborted) throw error; } }
+	const fallback = resolveEngine("researcher");
+	if (!fallback) return { note: "No engine was available to adjust the failed attempt." };
+	return attempt(fallback, false);
 });
 /** The app's ONE extraction pipeline instance — both front doors share it:
  *  quiz-triggered session runs (turn-service) and notes imports
