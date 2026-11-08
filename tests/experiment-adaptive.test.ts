@@ -6,7 +6,7 @@ import {join} from 'node:path';
 const root=mkdtempSync(join(tmpdir(),'lh-adaptive-'));process.env.LH_DATA_DIR=join(root,'data');process.env.LH_AUTH_FILE=join(root,'auth.json');
 const {jobStore}=await import('../src/store/jobs.ts');
 const {experimentTool}=await import('../src/agent/tools/experiment.ts');
-const {approveExperiment,startAttempt,setExperimentAdapter,readReceipt}=await import('../src/server/experiments/service.ts');
+const {approveExperiment,startAttempt,proposeMore,setExperimentAdapter,readReceipt}=await import('../src/server/experiments/service.ts');
 const {parsePlan,planDigest,stripAdaptive}=await import('../src/server/experiments/plan.ts');
 
 const PY='/usr/bin/python3';
@@ -95,6 +95,36 @@ test('giving up, no agent, and plans without an envelope all settle at once',asy
  jobStore.updateJob(strict.id,{experiment:{state:'awaiting_approval',digest:planDigest(parsePlan(plan(failing))),expiresAt:Date.now()+60000}});
  done=await approveAndSettle(jobStore.getJob(strict.id)!);
  assert.equal(done.status,'error');assert.equal(called,false,'a plan approved without an envelope is never adjusted');
+});
+
+test('a new proposal supersedes an older one that was never approved',async()=>{
+ const first=await propose(plan(fixed));const second=await propose(plan(fixed,{title:'Second'}));
+ const old=jobStore.getJob(first.id)!;
+ assert.equal(old.status,'error');assert.equal(old.experiment?.state,'revoked');assert.match(old.error??'',/Superseded/);
+ assert.equal(jobStore.getJob(second.id)!.experiment?.state,'awaiting_approval');
+ assert.throws(()=>approveExperiment(first.id,first.experiment!.digest,'learner-browser:local'));
+});
+
+test('the agent can ask for extra downloads in one new proposal, and the session ends pointing at it',async()=>{
+ const wheel={name:'cuda_tool-1.0-py3-none-any.whl',url:'https://files.pythonhosted.org/packages/aa/bb/cuda_tool-1.0-py3-none-any.whl',sha256:'a'.repeat(64),maxBytes:50*1048576};
+ let proposedId='';let rejected='';
+ setExperimentAdapter(async(request)=>{
+  try{proposeMore(request.parent.id,{reason:'x',downloads:[{...wheel,sha256:'b'.repeat(64),name:'cuda_tool-1.0-py3-none-any.whl'},{...wheel}],commands:fixed});}catch(error){rejected=String((error as Error).message);}
+  proposedId=proposeMore(request.parent.id,{reason:'The kernels need the CUDA compiler.',downloads:[wheel],environments:[{name:'cuda',addWheels:[wheel.name],maxInstalledMiB:1024}],commands:fixed,title:'With the CUDA compiler'}).jobId;
+  return {note:'The agent asked the learner for additional downloads in a new proposal ('+proposedId+')'};
+ });
+ const done=await approveAndSettle(await propose(plan(failing,{adaptive:{attempts:3,totalWallSeconds:120}})));
+ assert.match(rejected,/already exists with a different identity/);
+ const fresh=jobStore.getJob(proposedId)!;
+ const asked=parsePlan(fresh.input);
+ assert.equal(fresh.experiment?.state,'awaiting_approval');assert.equal(fresh.status,'running');
+ assert.deepEqual(asked.downloads.map(d=>d.name),[wheel.name]);
+ assert.deepEqual(asked.environments?.map(e=>({n:e.name,w:e.wheels})),[{n:'cuda',w:[wheel.name]}]);
+ assert.deepEqual(asked.adaptive,{attempts:4,totalWallSeconds:600});
+ assert.match(asked.purpose,/^The kernels need the CUDA compiler\./);
+ assert.equal(asked.title,'With the CUDA compiler');
+ assert.equal(done.status,'error');assert.match((done.result as {evidence:string}).evidence,/additional downloads in a new proposal/);
+ assert.equal(fresh.experiment?.digest,planDigest(asked));
 });
 
 test('an attempt can only start while the server holds a session open',()=>{

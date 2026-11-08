@@ -427,3 +427,59 @@ async function settleSession(parentId:string,lastId:string,last:ExperimentResult
  const fresh=jobStore.getJob(parentId)!;
  void deliverJobResult(revoked?buildAbortSteer(fresh):buildSubagentSteer(fresh,result)).catch(()=>undefined);
 }
+
+/** A new proposal replaces older ones that were never approved: only one proposal per lesson can wait for a decision,
+ *  so stale cards cannot pile up or be approved after the plan moved on. */
+export function supersedeProposals(chatId:string,keepId:string):void {
+ for(const old of jobStore.listJobs(chatId)){
+  if(old.id===keepId||old.kind!=='experiment'||old.status!=='running'||old.experiment?.state!=='awaiting_approval')continue;
+  revokeExperiment(old);
+  jobStore.updateJob(old.id,{status:'error',error:'Superseded by a newer proposal',activity:'superseded'});
+ }
+}
+
+export interface MorePatch {
+ reason:string;
+ downloads:{name:string;url:string;sha256:string;maxBytes:number}[];
+ environments?:{name:string;addWheels:string[];maxInstalledMiB?:number}[];
+ commands:string[][];title?:string;limits?:Record<string,number>;exports?:{path:string;maxBytes:number}[];
+}
+/** The agent needs something the approval does not cover (a tool, a library, a model file). It asks the learner for it
+ *  the only way that is ever allowed: a new proposal that lists the extra downloads in full, hash-pinned, next to
+ *  everything the first approval already granted. Everything unchanged stays cached, so only the new files are fetched.
+ *  The current session ends with a note that points at the new proposal. */
+export function proposeMore(parentId:string,patch:MorePatch):{jobId:string} {
+ safeId(parentId);
+ const parent=jobStore.getJob(parentId);const session=sessions.get(parentId);
+ if(!parent||parent.kind!=='experiment'||parent.status!=='running'||parent.experiment?.state==='revoked'||!session||session.active||session.controller.signal.aborted)throw new Error('No adjustment is open for this experiment');
+ const approved=parsePlan(parent.input);
+ const plan=structuredClone(stripAdaptive(approved)) as ExperimentPlan;
+ const have=new Map(plan.downloads.map(d=>[d.name,d]));
+ for(const download of patch.downloads){
+  const old=have.get(download.name);
+  if(old&&(old.url!==download.url||old.sha256!==download.sha256))throw new Error(`download ${download.name} already exists with a different identity`);
+  if(!old){plan.downloads.push({name:download.name,url:download.url,sha256:download.sha256,maxBytes:download.maxBytes});have.set(download.name,download);}
+ }
+ plan.environments??=[];
+ for(const entry of patch.environments??[]){
+  const existing=plan.environments.find(e=>e.name===entry.name);
+  if(existing){existing.wheels=[...new Set([...existing.wheels,...entry.addWheels])];if(entry.maxInstalledMiB)existing.maxInstalledMiB=Math.max(existing.maxInstalledMiB,entry.maxInstalledMiB);}
+  else plan.environments.push({name:entry.name,wheels:[...new Set(entry.addWheels)],maxInstalledMiB:entry.maxInstalledMiB??2048});
+ }
+ plan.commands=patch.commands;
+ plan.title=(patch.title??`${approved.title} (with extra downloads)`).slice(0,160);
+ plan.purpose=`${patch.reason.trim()}\n\n${approved.purpose}`.slice(0,2000);
+ for(const [key,value] of Object.entries(patch.limits??{})){
+  if(!(key in plan.limits))throw new Error(`Unknown limit ${key}`);
+  (plan.limits as unknown as Record<string,number>)[key]=value;
+ }
+ if(patch.exports)plan.exports=patch.exports;
+ const stagedMiB=Math.ceil(plan.downloads.reduce((n,d)=>n+d.maxBytes,0)/1048576);
+ if(stagedMiB>(plan.limits.stagedCacheMiB??0))plan.limits.stagedCacheMiB=Math.min(49152,stagedMiB);
+ plan.adaptive={attempts:4,totalWallSeconds:Math.min(14400,Math.max(600,plan.limits.wallSeconds*2))};
+ const proposed=parsePlan(plan);
+ const job=jobStore.createJob({kind:'experiment',chatId:parent.chatId,toolCallId:`more-${parentId}-${Date.now().toString(36)}`,input:proposed,activity:'awaiting approval — no active computation'});
+ jobStore.updateJob(job.id,{experiment:{state:'awaiting_approval',digest:planDigest(proposed),expiresAt:Date.now()+30*60*1000}});
+ supersedeProposals(parent.chatId,job.id);
+ return {jobId:job.id};
+}

@@ -10,6 +10,9 @@ MODEL_CACHE_ROOT = pathlib.Path(os.environ.get('LH_EXP_MODEL_CACHE') or (pathlib
 RETAINED_BLOBS_ROOT = pathlib.Path(os.environ.get('LH_EXP_RETAINED_BLOBS') or '/nonexistent/retained-blobs')
 MODEL_MAX_BYTES = 128 * 1024**3
 
+# CPU cores an experiment sandbox may use at once (a hard cgroup quota, not a pin). One core made JIT compilation and
+# server start-up needlessly slow; six leaves the desktop responsive on a 12-core machine.
+CPU_CORES = 6
 CLEAN = {'PATH':'/usr/bin','LANG':'C.UTF-8','HOME':'/workspace/home','TMPDIR':'/workspace/tmp','TRITON_LIBCUDA_PATH':'/usr/lib'}  # triton looks for libcuda via /sbin/ldconfig, absent in the sandbox
 class Cancelled(Exception): pass
 class Deadline(Exception): pass
@@ -374,7 +377,7 @@ def verify_controls(unit,limits):
     r=control(['show',unit])
     if r.returncode: raise RuntimeError('Cannot inspect effective service controls')
     props=dict(line.split('=',1) for line in r.stdout.splitlines() if '=' in line)
-    expected={'KillMode':'control-group','SendSIGKILL':'yes','NoNewPrivileges':'yes','MemoryMax':str(limits['memoryMiB']*1048576),'MemorySwapMax':'0','TasksMax':str(limits['tasks']),'LimitFSIZE':str(limits['diskMiB']*1048576),'CPUQuotaPerSecUSec':'1s','RuntimeMaxUSec':str(limits['wallSeconds'])+'s'}
+    expected={'KillMode':'control-group','SendSIGKILL':'yes','NoNewPrivileges':'yes','MemoryMax':str(limits['memoryMiB']*1048576),'MemorySwapMax':'0','TasksMax':str(limits['tasks']),'LimitFSIZE':str(limits['diskMiB']*1048576),'CPUQuotaPerSecUSec':str(CPU_CORES)+'s','RuntimeMaxUSec':str(limits['wallSeconds'])+'s'}
     def seconds(value):
         parts=re.findall(r'(\d+(?:\.\d+)?)(us|ms|s|min|h|d)',value or '')
         if not parts or ''.join(n+u for n,u in parts)!=(value or '').replace(' ',''): return -1
@@ -389,7 +392,7 @@ def verify_controls(unit,limits):
     actual={name:(root/name).read_text().strip() for name in ['memory.max','memory.swap.max','pids.max','cpu.max']}
     if actual['memory.max']!=expected['MemoryMax'] or actual['memory.swap.max']!='0' or actual['pids.max']!=expected['TasksMax']: raise RuntimeError('Hard cgroup limits unavailable')
     quota,period=map(int,actual['cpu.max'].split())
-    if quota!=period: raise RuntimeError('CPU cgroup quota unavailable')
+    if quota!=period*CPU_CORES: raise RuntimeError('CPU cgroup quota unavailable')
     if not props.get('MainPID','').isdigit() or int(props['MainPID'])<=0 or not re.fullmatch(r'[0-9a-f]{32}',props.get('InvocationID','')): raise RuntimeError('Live gate identity unavailable')
     return {'cgroup':cg,'properties':{k:props[k] for k in [*expected,'MainPID','InvocationID']},'cgroupControls':actual}
 
@@ -624,7 +627,7 @@ def execute(request):
             for device in ['/dev/nvidiactl','/dev/nvidia0','/dev/nvidia-uvm']:
                 args[insert:insert]=['--dev-bind',device,device];insert+=3
             gpu_lease=gpu_module.request()
-        props=['KillMode=control-group','SendSIGKILL=yes','NoNewPrivileges=yes','MemoryMax='+str(limits['memoryMiB']*1048576),'MemorySwapMax=0','TasksMax='+str(limits['tasks']),'RuntimeMaxSec='+str(limits['wallSeconds']),'LimitFSIZE='+str(limits['diskMiB']*1048576),'CPUQuota=100%','TimeoutStopSec=2s','StandardInput=pipe']
+        props=['KillMode=control-group','SendSIGKILL=yes','NoNewPrivileges=yes','MemoryMax='+str(limits['memoryMiB']*1048576),'MemorySwapMax=0','TasksMax='+str(limits['tasks']),'RuntimeMaxSec='+str(limits['wallSeconds']),'LimitFSIZE='+str(limits['diskMiB']*1048576),'CPUQuota='+str(CPU_CORES*100)+'%','TimeoutStopSec=2s','StandardInput=pipe']
         # --pipe sets StandardInput itself; do not use nonportable property value 'pipe'.
         props=props[:-1]
         if gpu_lease:props+=['Description=LearnHarness learnharness-experiment '+gpu_lease]

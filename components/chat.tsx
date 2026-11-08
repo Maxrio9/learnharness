@@ -1397,7 +1397,14 @@ export function Chat({
 						<PhaseChip phase={phases.at(-1) ?? "probe"} />
 					)}
 				</TopBar>
-				{(() => { const experiments=jobs.filter(job => job.kind === "experiment"); const pending=experiments.filter(job => job.status === "running" && job.experiment?.state === "awaiting_approval"); const latest=experiments[0]; const shown=pending.length ? pending : latest?.status === "error" && latest.experiment?.state === "revoked" ? [latest] : []; return shown.map(job => <div key={`pending-${job.id}:${job.experiment?.digest}`} className="max-h-[60vh] overflow-auto border-b px-3 pt-3"><div className="pb-3"><ExperimentCard job={job} /></div></div>); })()}
+				{(() => {
+					// Only proposals that still need a decision are pinned. A declined or superseded proposal is history, and a
+					// proposal that expired is hidden once a newer experiment exists, so old cards never linger above a live run.
+					const experiments = jobs.filter(job => job.kind === "experiment" && !job.experiment?.parentJobId);
+					const shown = experiments.filter(job => job.status === "running" && job.experiment?.state === "awaiting_approval"
+						&& !experiments.some(other => other.id !== job.id && other.createdAt > job.createdAt));
+					return shown.map(job => <div key={`pending-${job.id}:${job.experiment?.digest}`} className="max-h-[60vh] overflow-auto border-b px-3 pt-3"><div className="pb-3"><ExperimentCard job={job} /></div></div>);
+				})()}
 
 				<SessionFind scopeRef={sessionFindScopeRef} scrollContextRef={scrollContextRef} />
 				<div ref={sessionFindScopeRef} className="relative flex min-h-0 flex-1">

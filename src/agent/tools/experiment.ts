@@ -4,7 +4,7 @@ import type { AgentTool } from '@earendil-works/pi-agent-core';
 import { serverExecute } from '../tool-execute.ts';
 import type { JobToolContext } from './jobs.ts';
 import { parsePlan, planDigest, type ExperimentPlan } from '../../server/experiments/plan.ts';
-import { inspectExperiments, hardwareFacts } from '../../server/experiments/service.ts';
+import { inspectExperiments, hardwareFacts, supersedeProposals } from '../../server/experiments/service.ts';
 import { expandEnvironmentLocks, loadExperimentRecipe } from '../../server/experiments/environment-locks.ts';
 import { discoverModels } from '../../server/experiments/model-catalog.ts';
 const text=Type.String({minLength:1,maxLength:8192});
@@ -166,6 +166,7 @@ export function experimentTool(ctx:JobToolContext):AgentTool<any> {
   if(old)return `Proposal ${old.id} already exists. Waiting approval is not active computation.`;
   const job=ctx.jobStore.createJob({kind:'experiment',chatId:ctx.chatId,toolCallId,input:plan,activity:'awaiting approval — no active computation'});
   ctx.jobStore.updateJob(job.id,{experiment:{state:'awaiting_approval',digest:planDigest(plan),expiresAt:Date.now()+30*60*1000}});
+  supersedeProposals(ctx.chatId,job.id);
   return `Experiment proposal ${job.id} awaits explicit learner approval in its native card. Waiting approval is not active computation. Continue teaching. This tool cannot approve or run the plan.${input.action==='propose_variant'?` Effective plan: limits ${JSON.stringify(plan.limits)}; ${plan.commands.length} command(s); ${plan.downloads.length} download(s) and ${plan.environments?.length??0} environment(s) carried over unchanged from ${input.baseJobId}. Anything you did not pass (title, purpose, limits, exports, replace) is unchanged from the base; this proposal cannot be edited again.`:''}`;
  })};
 }
