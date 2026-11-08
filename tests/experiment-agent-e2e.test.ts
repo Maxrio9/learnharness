@@ -187,6 +187,7 @@ test('get_plan, propose_variant and inspect let the specialist revise a proposal
  await assert.rejects(()=>run('v0b',{action:'propose_variant',baseJobId:'job_does_not_exist'}),/Unknown proposal/);
  const out=toolText(await run('experiment-proposal-variant',{action:'propose_variant',baseJobId:base.id,title:'Revised check',limits:{wallSeconds:5},replace:[{command:0,find:'print(2+2)',replace:'print(3+3)'}]}));
  assert.match(out,/awaits explicit learner approval/);
+ assert.match(out,/Effective plan: limits \{[^}]*"wallSeconds":5[^}]*\}/);assert.match(out,/carried over unchanged from/);
  const made=jobStore.findJobByToolCallId(chat.id,'experiment-proposal-variant')!;
  const revised=made.input as typeof plan;
  assert.equal(revised.title,'Revised check');assert.equal(revised.limits.wallSeconds,5);
@@ -198,4 +199,18 @@ test('schema errors name the requested action only, with short field messages',(
  try{prepareExperimentArguments({action:'propose_locked',plan:{},locks:[]});assert.fail('expected a throw');}
  catch(error){const message=String((error as Error).message);assert.match(message,/^Invalid propose_locked arguments\. Fix these and resubmit: /);assert.doesNotMatch(message,/recipeId/);assert.ok(message.length<900,message.length.toString());}
  const fine={action:'inspect'};assert.equal(prepareExperimentArguments(fine),fine);
+});
+
+test('propose_variant arguments sent as quoted JSON strings, or with leaked tool-call tags, are repaired',async()=>{
+ // Captured GLM shape: replace/limits arrive as JSON-encoded strings.
+ const mangled={action:'propose_variant',baseJobId:'job_abc',purpose:'Larger sweep',replace:JSON.stringify([{all:false,command:0,find:'MAX_OUTPUT = 16',replace:'MAX_OUTPUT = 32'}]),limits:JSON.stringify({wallSeconds:2400})};
+ const fixed=prepareExperimentArguments(mangled) as {replace:unknown[];limits:Record<string,number>};
+ assert.ok(Array.isArray(fixed.replace)&&fixed.replace.length===1);assert.equal(fixed.limits.wallSeconds,2400);
+ // Tags leaked into the action value.
+ const leaked={action:'propose_variant<arg_key>baseJobId</arg_key><arg_value>job_abc</arg_value>',title:'Revised'};
+ const repaired=prepareExperimentArguments(leaked) as {action:string;baseJobId:string;title:string};
+ assert.equal(repaired.action,'propose_variant');assert.equal(repaired.baseJobId,'job_abc');assert.equal(repaired.title,'Revised');
+ // A string that is not valid JSON still fails, and the error says what went wrong.
+ try{prepareExperimentArguments({action:'propose_variant',baseJobId:'job_abc',replace:'[{"command":0'});assert.fail('expected a throw');}
+ catch(error){assert.match(String((error as Error).message),/\/replace must be array \(you sent a quoted string/);}
 });

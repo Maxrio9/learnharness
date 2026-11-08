@@ -56,8 +56,17 @@ export function decodeStructuredFields(args:unknown):unknown {
  if(!plainObject(args))return args;
  const input=args;let out:Record<string,unknown>|undefined;
  const set=(key:string,value:unknown)=>{(out??={...input})[key]=value;};
- if(typeof input.locks==='string'){
-  try{const parsed=JSON.parse(input.locks);if(Array.isArray(parsed))set('locks',parsed);}catch{/* rejected by validation */}
+ // GLM sometimes leaks its tool-call tags into the first string value:
+ //   {"action":"propose_variant<arg_key>baseJobId</arg_key><arg_value>job_x</arg_value>"}
+ if(typeof input.action==='string'&&input.action.includes('<arg_key>')){
+  const head=input.action.split('<')[0]!;set('action',head);
+  for(const m of input.action.matchAll(/<arg_key>([A-Za-z_]+)<\/arg_key>\s*<arg_value>([\s\S]*?)(?:<\/arg_value>|$)/g)){if(!(m[1]! in input))set(m[1]!,m[2]!.trim());}
+ }
+ const current=(out??input) as Record<string,unknown>;
+ const wanted:Record<string,'object'|'array'>=current.action==='propose_variant'?{replace:'array',limits:'object',exports:'array'}:{locks:'array'};
+ for(const [key,kind] of Object.entries(wanted)){
+  const value=current[key];if(typeof value!=='string')continue;
+  try{const parsed=JSON.parse(value);if(kind==='array'?Array.isArray(parsed):plainObject(parsed))set(key,parsed);}catch{/* rejected by validation */}
  }
  if(input.action==='propose'||input.action==='propose_locked'){
   const spilled=PLAN_FIELDS.filter(key=>key in input);
@@ -111,7 +120,11 @@ export function prepareExperimentArguments(args:unknown):unknown {
   const variant=allVariants.find(v=>(v as unknown as {properties:{action:{const:unknown}}}).properties.action.const===decoded.action);
   if(variant){
    const errors=[...Value.Errors(variant,decoded)].filter(e=>e.message!=='schema is false');
-   if(errors.length)throw new Error(`Invalid ${String(decoded.action)} arguments. Fix these and resubmit: ${errors.slice(0,6).map(e=>`${e.instancePath||'/'} ${e.message}`).join('; ')}`);
+   const describe=(e:{instancePath:string;message:string})=>{
+    const value=e.instancePath.split('/').filter(Boolean).reduce<unknown>((v,k)=>(v&&typeof v==='object'?(v as Record<string,unknown>)[k]:undefined),decoded);
+    return `${e.instancePath||'/'} ${e.message}${typeof value==='string'&&/^must be (array|object)/.test(e.message)?' (you sent a quoted string; send the JSON value itself, not a string containing JSON)':''}`;
+   };
+   if(errors.length)throw new Error(`Invalid ${String(decoded.action)} arguments. Fix these and resubmit: ${errors.slice(0,6).map(describe).join('; ')}`);
   }
  }
  return decoded;
@@ -119,7 +132,7 @@ export function prepareExperimentArguments(args:unknown):unknown {
 
 /** Private to the experiment specialist. No approval or execution capability. */
 export function experimentTool(ctx:JobToolContext):AgentTool<any> {
- return {name:'experiment',label:'experiment',parameters:schema,executionMode:'sequential',prepareArguments:prepareExperimentArguments as never,description:'Inspect runtime and model metadata or submit one exact plan for approval. Version 3 may prepare or reuse up to four independent Python 3.12 wheel environments and run the complete comparison in one approval. Each environment lists wheel filenames from the plan’s direct HTTPS downloads, with verified SHA-256 and byte bounds. Use /environments/<name>/python; the environment is read-only during execution. Use identical pinned wheels to reuse it. To revise an earlier proposal of this lesson, call get_plan with its jobId to read the commands, then propose_variant with title, purpose, limits, exports and small exact replace edits ({command, find, replace}); everything else is carried over unchanged, which is far faster than rewriting the plan. When inspect lists a recipe matching the request, propose_recipe submits that exact plan by recipeId for a new approval. When inspect lists curated environment locks, use propose_locked with the lock IDs and mount names; LearnHarness expands every wheel into the exact approval plan. The sandbox permits only off or private loopback networking. Version 3 mounts only the model files pinned by the optional model field at /model. Use a model manifest from inspect when available. GPU plans can use /usr/bin/nsys. Legacy version 2 uses /model-cache. Discovery is metadata only. Never invent a dependency lock, hash, or observed result.',execute:serverExecute('experiment',schema,async (input:any,{toolCallId,signal})=>{
+ return {name:'experiment',label:'experiment',parameters:schema,executionMode:'sequential',prepareArguments:prepareExperimentArguments as never,description:'Inspect runtime and model metadata or submit one exact plan for approval. Version 3 may prepare or reuse up to four independent Python 3.12 wheel environments and run the complete comparison in one approval. Each environment lists wheel filenames from the plan’s direct HTTPS downloads, with verified SHA-256 and byte bounds. Use /environments/<name>/python; the environment is read-only during execution. Use identical pinned wheels to reuse it. To revise an earlier proposal of this lesson, call get_plan with its jobId to read the commands, then propose_variant with title, purpose, limits, exports and small exact replace edits ({command, find, replace}). Put EVERY limit the request changes into limits (for example {"wallSeconds":2400}); stating it in the purpose does not change it. Everything not passed is carried over unchanged, which is far faster than rewriting the plan. When inspect lists a recipe matching the request, propose_recipe submits that exact plan by recipeId for a new approval. When inspect lists curated environment locks, use propose_locked with the lock IDs and mount names; LearnHarness expands every wheel into the exact approval plan. The sandbox permits only off or private loopback networking. Version 3 mounts only the model files pinned by the optional model field at /model. Use a model manifest from inspect when available. GPU plans can use /usr/bin/nsys. Legacy version 2 uses /model-cache. Discovery is metadata only. Never invent a dependency lock, hash, or observed result.',execute:serverExecute('experiment',schema,async (input:any,{toolCallId,signal})=>{
   if(!input||(input.action==='propose_variant'?!Object.keys(input).every(k=>['action','baseJobId','title','purpose','limits','exports','replace'].includes(k)):Object.keys(input).sort().join(',')!==(input.action==='propose_locked'?'action,locks,plan':input.action==='propose_recipe'?'action,recipeId':input.action==='propose'?'action,plan':input.action==='get_plan'?'action,jobId':'action')))throw new Error('Exact discriminated action required');
   if(input.action==='inspect'){
    const previousProposals=ctx.jobStore.listJobs(ctx.chatId).filter(j=>j.kind==='experiment').slice(-8).map(j=>{try{const p=parsePlan(j.input);return {jobId:j.id,title:p.title,state:j.experiment?.state,status:j.status,gpu:p.gpu,commands:p.commands.length,scriptBytes:p.commands.reduce((n,c)=>n+c.reduce((m,a)=>m+a.length,0),0)};}catch{return {jobId:j.id,state:j.experiment?.state,status:j.status};}});
@@ -133,6 +146,6 @@ export function experimentTool(ctx:JobToolContext):AgentTool<any> {
   if(old)return `Proposal ${old.id} already exists. Waiting approval is not active computation.`;
   const job=ctx.jobStore.createJob({kind:'experiment',chatId:ctx.chatId,toolCallId,input:plan,activity:'awaiting approval — no active computation'});
   ctx.jobStore.updateJob(job.id,{experiment:{state:'awaiting_approval',digest:planDigest(plan),expiresAt:Date.now()+30*60*1000}});
-  return `Experiment proposal ${job.id} awaits explicit learner approval in its native card. Waiting approval is not active computation. Continue teaching. This tool cannot approve or run the plan.`;
+  return `Experiment proposal ${job.id} awaits explicit learner approval in its native card. Waiting approval is not active computation. Continue teaching. This tool cannot approve or run the plan.${input.action==='propose_variant'?` Effective plan: limits ${JSON.stringify(plan.limits)}; ${plan.commands.length} command(s); ${plan.downloads.length} download(s) and ${plan.environments?.length??0} environment(s) carried over unchanged from ${input.baseJobId}. Anything you did not pass (title, purpose, limits, exports, replace) is unchanged from the base; this proposal cannot be edited again.`:''}`;
  })};
 }
