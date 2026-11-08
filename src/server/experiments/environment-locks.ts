@@ -57,10 +57,17 @@ function loadLock(id:string):Lock {
   return {label:parsed.title,maxInstalledMiB:parsed.environments![0]!.maxInstalledMiB,wheels:parsed.downloads};
 }
 
-export function listEnvironmentLocks():{id:string;label:string;wheels:number;downloadBytes:number;maxInstalledMiB:number}[] {
+const KEY_PACKAGE=/^(torch|vllm|sglang|sgl[-_]kernel|flashinfer[-_]python|flash[-_]attn[-_0-9a-z]*|triton|xformers|transformers|nvidia[-_]cuda[-_]runtime[-_a-z0-9]*)$/i;
+/** The packages that decide hardware compatibility (framework, engine, kernels, CUDA runtime), as name==version. */
+export function keyPackagesOf(wheels:{name:string}[]):string[] {
+ const out:string[]=[];
+ for(const w of wheels){const m=/^([A-Za-z0-9_.]+?)-([0-9][^-]*)-/.exec(w.name);if(m&&KEY_PACKAGE.test(m[1]!))out.push(`${m[1]}==${m[2]}`);if(out.length>=16)break;}
+ return out;
+}
+export function listEnvironmentLocks():{id:string;label:string;wheels:number;downloadBytes:number;maxInstalledMiB:number;keyPackages:string[]}[] {
  try {
   const names=readdirSync(root).filter(n=>n.endsWith('.json')&&idPattern.test(n.slice(0,-5))).sort().slice(0,16);
-  return names.flatMap(n=>{try{const id=n.slice(0,-5),lock=loadLock(id);return [{id,label:lock.label,wheels:lock.wheels.length,downloadBytes:lock.wheels.reduce((n,w)=>n+w.maxBytes,0),maxInstalledMiB:lock.maxInstalledMiB}];}catch{return [];}});
+  return names.flatMap(n=>{try{const id=n.slice(0,-5),lock=loadLock(id);return [{id,label:lock.label,wheels:lock.wheels.length,downloadBytes:lock.wheels.reduce((n,w)=>n+w.maxBytes,0),maxInstalledMiB:lock.maxInstalledMiB,keyPackages:keyPackagesOf(lock.wheels)}];}catch{return [];}});
  }catch{return [];}
 }
 

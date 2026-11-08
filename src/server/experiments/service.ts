@@ -3,8 +3,8 @@ import { listEnvironmentLocks, listExperimentRecipes, listModelLocks } from './e
 import { redactEvidence, boundedText } from './evidence.ts';
 import { artifactDigest, runFacts } from './digest.ts';
 import * as path from 'node:path';
-import { spawn, execFile } from 'node:child_process';
-import { homedir } from 'node:os';
+import { spawn, execFile, execFileSync } from 'node:child_process';
+import { homedir, cpus } from 'node:os';
 import { createHash } from 'node:crypto';
 import { PATHS, ROOT } from '../../../config.ts';
 import { jobStore } from '../../store/jobs.ts';
@@ -55,6 +55,24 @@ export function readReceipt(id:string):unknown {
 }
 /** Non-executing inventory: identities only, never registry paths/values or secrets.
  * Availability is informational; backend revalidates all identities/headroom. */
+const ARCHITECTURES:Record<string,string>={'7.0':'Volta (SM70)','7.5':'Turing (SM75)','8.0':'Ampere datacenter (SM80)','8.6':'Ampere (SM86)','8.7':'Ampere Jetson (SM87)','8.9':'Ada (SM89)','9.0':'Hopper (SM90)','10.0':'Blackwell datacenter (SM100)','10.3':'Blackwell Ultra datacenter (SM103)','12.0':'Blackwell workstation/consumer (SM120)','12.1':'Blackwell GB10 / DGX Spark (SM121, ARM64 host)'};
+let hardwareCache:{at:number;value:Record<string,unknown>}|undefined;
+/** Live facts about the machine the experiment will actually run on, so engine versions and kernel backends are
+ *  chosen for this hardware rather than from memory. Metadata only; never a grant. */
+export function hardwareFacts():Record<string,unknown> {
+ if(hardwareCache&&Date.now()-hardwareCache.at<15000)return hardwareCache.value;
+ const value:Record<string,unknown>={cpuCount:cpus().length,arch:process.arch};
+ try{
+  const meminfo=fs.readFileSync('/proc/meminfo','utf8');const kib=(k:string)=>Number(new RegExp(`^${k}:\\s+(\\d+) kB`,'m').exec(meminfo)?.[1]);
+  if(Number.isFinite(kib('MemAvailable')))value.hostRamAvailableMiB=Math.round(kib('MemAvailable')/1024);
+  if(Number.isFinite(kib('MemTotal')))value.hostRamTotalMiB=Math.round(kib('MemTotal')/1024);
+ }catch{/* not Linux */}
+ try{
+  const out=execFileSync('/usr/bin/nvidia-smi',['--query-gpu=index,name,compute_cap,driver_version,memory.total,memory.free','--format=csv,noheader,nounits'],{env:{PATH:'/usr/bin',LANG:'C.UTF-8'} as unknown as NodeJS.ProcessEnv,timeout:4000,encoding:'utf8',stdio:['ignore','pipe','ignore']});
+  value.gpus=out.trim().split('\n').slice(0,8).map(line=>{const [index,name,cc,driver,total,free]=line.split(',').map(x=>x.trim());return {index:Number(index),name,computeCapability:cc,architecture:ARCHITECTURES[cc!]??'unknown',driver,memoryTotalMiB:Number(total),memoryFreeMiB:Number(free)};});
+ }catch{value.gpus=[];value.gpuNote='nvidia-smi unavailable';}
+ hardwareCache={at:Date.now(),value};return value;
+}
 export function inspectExperiments():Record<string,unknown> {
  const executable=(p:string)=>{try{fs.accessSync(p,fs.constants.X_OK);return true;}catch{return false;}};
  let registryCandidates:string[]=[];
@@ -63,7 +81,7 @@ export function inspectExperiments():Record<string,unknown> {
   const s=fs.lstatSync(p);if(!s.isFile()||s.nlink!==1||s.size>65536)throw Error('Unbounded registry');
   const entries=JSON.parse(fs.readFileSync(p,'utf8'));if(entries&&typeof entries==='object'&&!Array.isArray(entries))registryCandidates=Object.keys(entries).filter(k=>/^[a-zA-Z0-9][a-zA-Z0-9_.-]*@[a-f0-9]{64}$/.test(k)&&k.length<=80).sort().slice(0,32);
  }catch{/* Missing registry is not a reason to perform setup or execution. */}
- return {runtime:process.platform,cpuCandidate:process.platform==='linux',effectiveControlsVerified:false,bwrap:executable('/usr/bin/bwrap'),systemdRun:executable('/usr/bin/systemd-run'),planVersions:[1,2,3],v2Ceilings:{wallSeconds:3600,memoryMiB:24576,tasks:256,diskMiB:16384,outputBytes:65536,stagedCacheMiB:49152,artifactBytes:536870912},registryCandidates,registryCandidatesVerified:false,environmentLocks:listEnvironmentLocks(),recipes:listExperimentRecipes(),modelLocks:listModelLocks(),profiling:{nsys:executable('/usr/bin/nsys'),note:'CUDA trace export requires a GPU v2 or v3 plan and an approved workspace export.'},pythonPreparation:{python312:executable('/usr/lib/nsight-systems/target-linux-x64/python/bin/python'),persistentEnvironments:executable(`${process.env.LH_EXP_PYTHON_RUNTIME||`${homedir()}/.local/share/uv/python/cpython-3.12.15-linux-x86_64-gnu`}/bin/python3.12`)&&!!process.env.LH_EXP_STORAGE_HELPER&&executable(process.env.LH_EXP_STORAGE_HELPER),persistentRuntime:'CPython 3.12.15 Linux x86_64',planVersion:3,environmentLimit:4,wheelLimit:256,maxInstalledMiB:32768,note:'One plan may build or reuse exact locked wheel environments and run the approved commands. Execute with /environments/<name>/python. Storage, wheel compatibility, and GPU admission are checked at execution.'},gpu:{requestedByVersion:[2,3],requiredClass:'foreground',readiness:'GPU plans request foreground desktop admission at execution; availability is determined by the authority. Version 3 verifies selected model files and mounts them read-only at /model; version 2 uses /model-cache.'}};
+ return {runtime:process.platform,hardware:hardwareFacts(),cpuCandidate:process.platform==='linux',effectiveControlsVerified:false,bwrap:executable('/usr/bin/bwrap'),systemdRun:executable('/usr/bin/systemd-run'),planVersions:[1,2,3],v2Ceilings:{wallSeconds:3600,memoryMiB:24576,tasks:256,diskMiB:16384,outputBytes:65536,stagedCacheMiB:49152,artifactBytes:536870912},registryCandidates,registryCandidatesVerified:false,environmentLocks:listEnvironmentLocks(),recipes:listExperimentRecipes(),modelLocks:listModelLocks(),profiling:{nsys:executable('/usr/bin/nsys'),note:'CUDA trace export requires a GPU v2 or v3 plan and an approved workspace export.'},pythonPreparation:{python312:executable('/usr/lib/nsight-systems/target-linux-x64/python/bin/python'),persistentEnvironments:executable(`${process.env.LH_EXP_PYTHON_RUNTIME||`${homedir()}/.local/share/uv/python/cpython-3.12.15-linux-x86_64-gnu`}/bin/python3.12`)&&!!process.env.LH_EXP_STORAGE_HELPER&&executable(process.env.LH_EXP_STORAGE_HELPER),persistentRuntime:'CPython 3.12.15 Linux x86_64',planVersion:3,environmentLimit:4,wheelLimit:256,maxInstalledMiB:32768,note:'One plan may build or reuse exact locked wheel environments and run the approved commands. Execute with /environments/<name>/python. Storage, wheel compatibility, and GPU admission are checked at execution.'},gpu:{requestedByVersion:[2,3],requiredClass:'foreground',readiness:'GPU plans request foreground desktop admission at execution; availability is determined by the authority. Version 3 verifies selected model files and mounts them read-only at /model; version 2 uses /model-cache.'}};
 }
 // Next augments ProcessEnv with required NODE_ENV; intentionally absent in subprocesses.
 function cleanEnv():NodeJS.ProcessEnv {const uid=process.getuid?.();return {PATH:'/usr/bin',LANG:'C.UTF-8',HOME:homedir(),XDG_RUNTIME_DIR:`/run/user/${uid}`,DBUS_SESSION_BUS_ADDRESS:`unix:path=/run/user/${uid}/bus`} as unknown as NodeJS.ProcessEnv;}

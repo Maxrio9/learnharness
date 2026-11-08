@@ -179,7 +179,11 @@ test('get_plan, propose_variant and inspect let the specialist revise a proposal
  const base=jobStore.createJob({kind:'experiment',chatId:chat.id,toolCallId:'base-proposal',input:plan,activity:'awaiting approval'});
  const tool=experimentTool({chatId:chat.id,jobStore,spawn:()=>{throw new Error('unused');}} as never);
  const run=(id:string,args:unknown)=>tool.execute(id,prepareExperimentArguments(args) as never,undefined as never,undefined as never);
- assert.match(toolText(await run('i1',{action:'inspect'})),new RegExp(`"jobId":"${base.id}".*"revision":"To revise`));
+ assert.match(toolText(await run('i1',{action:'inspect'})),new RegExp(`"jobId":"${base.id}".*"revision":"Check hardware`));
+ const inspected=JSON.parse(toolText(await run('i2',{action:'inspect'})));
+ assert.equal(typeof inspected.hardware.cpuCount,'number');assert.ok(Array.isArray(inspected.hardware.gpus));
+ await assert.rejects(()=>run('g0',{action:'get_plan'}),/exactly one of/);
+ await assert.rejects(()=>run('g00',{action:'get_plan',jobId:base.id,recipeId:'a'.repeat(64)}),/exactly one of/);
  const compact=JSON.parse(toolText(await run('g1',{action:'get_plan',jobId:base.id})));
  assert.equal(compact.title,plan.title);assert.deepEqual(compact.commands,plan.commands);assert.equal(typeof compact.downloads,'number');
  // edits: unknown text, then a valid one; the new proposal keeps everything else
