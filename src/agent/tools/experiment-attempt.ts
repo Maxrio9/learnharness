@@ -38,7 +38,7 @@ export function prepareAttemptArguments(args:unknown):unknown {
 /** The only tool of the agent that adjusts a failed attempt. It cannot widen the approval: the service re-validates every
  *  attempt against the approved plan (same downloads, environments, model, GPU, network; limits only down; attempts and
  *  total time within the approved budget). */
-export function attemptTool(parentId:string,onGiveUp:(reason:string)=>void,onProposed:(jobId:string,reason:string)=>void=()=>undefined):AgentTool<any> {
+export function attemptTool(parentId:string,onGiveUp:(reason:string)=>void,onProposed:(jobId:string,reason:string)=>void=()=>undefined,onRetried:()=>void=()=>undefined):AgentTool<any> {
  return {name:'experiment_attempt',label:'experiment attempt',parameters:schema,executionMode:'sequential',prepareArguments:prepareAttemptArguments as never,
   description:'Correct a failed experiment attempt inside the learner\'s existing approval. retry: pass the COMPLETE corrected command list (not a diff), optionally a title, lower limits and different exports; the sandbox, downloads, environments, model, GPU and network stay exactly as approved and limits can only go down. The attempt starts immediately and its receipt is handled for you. give_up: stop and state exactly why the goal cannot be met inside the approval. propose_more: when the goal needs something the approval does not cover (a tool such as the CUDA compiler, a library, a file), ask the learner for it: pass the extra downloads as hash-pinned wheel or file entries (name, https url, sha256, maxBytes), optionally an environment to add or extend (addWheels), and the COMPLETE command list to run once approved. Request everything you can foresee in ONE call; a single package on its own is fine. The current session ends and the learner approves the new proposal. Call exactly one of them.',
   execute:serverExecute('experiment_attempt',schema,async (input:any)=>{
@@ -49,6 +49,7 @@ export function attemptTool(parentId:string,onGiveUp:(reason:string)=>void,onPro
    }
    if(input.action==='give_up'){onGiveUp(String(input.reason));return 'Recorded. Reply with one short sentence.';}
    const started=startAttempt(parentId,{commands:input.commands,title:input.title,limits:input.limits,exports:input.exports});
+   onRetried();
    return `Attempt ${started.n} started now inside the approval. You will not see its result; reply with one short sentence describing what you changed.`;
   })};
 }
