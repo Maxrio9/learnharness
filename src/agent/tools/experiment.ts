@@ -1,8 +1,9 @@
 import { Type } from 'typebox';
+import { Value } from 'typebox/value';
 import type { AgentTool } from '@earendil-works/pi-agent-core';
 import { serverExecute } from '../tool-execute.ts';
 import type { JobToolContext } from './jobs.ts';
-import { parsePlan, planDigest } from '../../server/experiments/plan.ts';
+import { parsePlan, planDigest, type ExperimentPlan } from '../../server/experiments/plan.ts';
 import { inspectExperiments } from '../../server/experiments/service.ts';
 import { expandEnvironmentLocks, loadExperimentRecipe } from '../../server/experiments/environment-locks.ts';
 import { discoverModels } from '../../server/experiments/model-catalog.ts';
@@ -21,7 +22,11 @@ const versionSchema=(version:1|2|3)=>{const v2=version>=2,v3=version===3;return 
 },{additionalProperties:false});};
 const planSchema=Type.Union([versionSchema(1),versionSchema(2),versionSchema(3)]);
 const lockedPlan=Type.Omit(versionSchema(3),['downloads','environments']);
-const schema=Type.Union([Type.Object({action:Type.Literal('propose_recipe'),recipeId:Type.String({pattern:'^[a-f0-9]{64}$'})},{additionalProperties:false}),Type.Object({action:Type.Literal('propose_locked'),plan:lockedPlan,locks:Type.Array(Type.Object({name:Type.String({pattern:'^[a-z][a-z0-9-]{0,31}$'}),lockId:Type.String({pattern:'^[a-f0-9]{64}$'})},{additionalProperties:false}),{minItems:1,maxItems:4})},{additionalProperties:false}),Type.Object({action:Type.Literal('inspect')},{additionalProperties:false}),Type.Object({action:Type.Literal('discover_models')},{additionalProperties:false}),Type.Object({action:Type.Literal('propose'),plan:planSchema},{additionalProperties:false})]);
+const jobIdSchema=Type.String({pattern:'^job_[A-Za-z0-9_-]{1,100}$'});
+const getPlanSchema=Type.Object({action:Type.Literal('get_plan'),jobId:jobIdSchema},{additionalProperties:false});
+const proposeVariantSchema=Type.Object({action:Type.Literal('propose_variant'),baseJobId:jobIdSchema,title:Type.Optional(Type.String({minLength:1,maxLength:160})),purpose:Type.Optional(Type.String({minLength:1,maxLength:2000})),limits:Type.Optional(Type.Record(Type.String({pattern:'^[A-Za-z]{1,32}$'}),Type.Integer({minimum:0,maximum:536870912}))),exports:Type.Optional(Type.Array(Type.Object({path:Type.String({minLength:1,maxLength:160}),maxBytes:bounded(1,536870912)},{additionalProperties:false}),{maxItems:16})),replace:Type.Optional(Type.Array(Type.Object({command:Type.Integer({minimum:0,maximum:15}),find:Type.String({minLength:1,maxLength:4000}),replace:Type.String({maxLength:16000}),all:Type.Optional(Type.Boolean())},{additionalProperties:false}),{maxItems:20}))},{additionalProperties:false});
+const allVariants=[Type.Object({action:Type.Literal('propose_recipe'),recipeId:Type.String({pattern:'^[a-f0-9]{64}$'})},{additionalProperties:false}),Type.Object({action:Type.Literal('propose_locked'),plan:lockedPlan,locks:Type.Array(Type.Object({name:Type.String({pattern:'^[a-z][a-z0-9-]{0,31}$'}),lockId:Type.String({pattern:'^[a-f0-9]{64}$'})},{additionalProperties:false}),{minItems:1,maxItems:4})},{additionalProperties:false}),Type.Object({action:Type.Literal('inspect')},{additionalProperties:false}),Type.Object({action:Type.Literal('discover_models')},{additionalProperties:false}),Type.Object({action:Type.Literal('propose'),plan:planSchema},{additionalProperties:false}),getPlanSchema,proposeVariantSchema];
+const schema=Type.Union(allVariants);
 /** Local models mangle nested tool arguments in two ways, and both are rejected by pi's schema validation before
  *  the tool runs (the model then repeats the same payload and gives up with a bogus "transport blocker"):
  *   1. a structured argument sent as ONE JSON-encoded string ("plan: must be object", "locks: must be array");
@@ -54,7 +59,7 @@ export function decodeStructuredFields(args:unknown):unknown {
  if(typeof input.locks==='string'){
   try{const parsed=JSON.parse(input.locks);if(Array.isArray(parsed))set('locks',parsed);}catch{/* rejected by validation */}
  }
- if(String(input.action).startsWith('propose')&&input.action!=='propose_recipe'){
+ if(input.action==='propose'||input.action==='propose_locked'){
   const spilled=PLAN_FIELDS.filter(key=>key in input);
   const plan=typeof input.plan==='string'?decodePlanString(input.plan):plainObject(input.plan)?input.plan:undefined;
   if(plan&&!spilled.length){if(plan!==input.plan)set('plan',plan);}
@@ -67,14 +72,63 @@ export function decodeStructuredFields(args:unknown):unknown {
  return out??args;
 }
 
+function proposalOf(ctx:JobToolContext,id:string) {
+ const job=ctx.jobStore.getJob(id);
+ if(!job||job.kind!=='experiment'||job.chatId!==ctx.chatId)throw new Error('Unknown proposal in this lesson');
+ return job;
+}
+/** A previous plan without its bulky download/wheel lists, so a revision costs reading, not rewriting. */
+function compactPlan(plan:ExperimentPlan):Record<string,unknown> {
+ return {version:plan.version,title:plan.title,purpose:plan.purpose,gpu:plan.gpu,network:plan.network,limits:plan.limits,exports:plan.exports,
+  model:plan.model?{repo:plan.model.repo,revision:plan.model.revision,files:plan.model.files.length}:undefined,
+  environments:plan.environments?.map(e=>({name:e.name,wheels:e.wheels.length,maxInstalledMiB:e.maxInstalledMiB})),
+  downloads:plan.downloads.length,commands:plan.commands};
+}
+/** Revise an earlier proposal of this lesson with small, exact edits. Everything not edited (downloads, hashes,
+ *  environments, model files) is carried over byte for byte, and the result goes through the same strict parsePlan. */
+function variantPlan(ctx:JobToolContext,input:Record<string,any>):ExperimentPlan {
+ const plan=structuredClone(parsePlan(proposalOf(ctx,input.baseJobId).input)) as ExperimentPlan;
+ if(input.title)plan.title=input.title;
+ if(input.purpose)plan.purpose=input.purpose;
+ if(input.limits)Object.assign(plan.limits,input.limits);
+ if(input.exports){if(plan.version===1)throw new Error('This plan version has no exports');plan.exports=input.exports;}
+ for(const edit of (input.replace??[]) as {command:number;find:string;replace:string;all?:boolean}[]){
+  const argv=plan.commands[edit.command];
+  if(!argv)throw new Error(`replace: there is no command ${edit.command}`);
+  let hits=0;
+  const next=argv.map(arg=>{const n=arg.split(edit.find).length-1;hits+=n;return n?(edit.all?arg.split(edit.find).join(edit.replace):arg.replace(edit.find,()=>edit.replace)):arg;});
+  if(!hits)throw new Error(`replace: the text to find does not occur in command ${edit.command}; use get_plan to copy it exactly`);
+  if(hits>1&&!edit.all)throw new Error(`replace: the text occurs ${hits} times in command ${edit.command}; include more surrounding text or set all`);
+  plan.commands[edit.command]=next;
+ }
+ return parsePlan(plan);
+}
+/** Decode mangled nested arguments, then report schema errors for the action actually requested (pi's own
+ *  union error also lists every other action's complaints, which sends small models in circles). */
+export function prepareExperimentArguments(args:unknown):unknown {
+ const decoded=decodeStructuredFields(args);
+ if(plainObject(decoded)){
+  const variant=allVariants.find(v=>(v as unknown as {properties:{action:{const:unknown}}}).properties.action.const===decoded.action);
+  if(variant){
+   const errors=[...Value.Errors(variant,decoded)].filter(e=>e.message!=='schema is false');
+   if(errors.length)throw new Error(`Invalid ${String(decoded.action)} arguments. Fix these and resubmit: ${errors.slice(0,6).map(e=>`${e.instancePath||'/'} ${e.message}`).join('; ')}`);
+  }
+ }
+ return decoded;
+}
+
 /** Private to the experiment specialist. No approval or execution capability. */
 export function experimentTool(ctx:JobToolContext):AgentTool<any> {
- return {name:'experiment',label:'experiment',parameters:schema,executionMode:'sequential',prepareArguments:decodeStructuredFields as never,description:'Inspect runtime and model metadata or submit one exact plan for approval. Version 3 may prepare or reuse up to four independent Python 3.12 wheel environments and run the complete comparison in one approval. Each environment lists wheel filenames from the plan’s direct HTTPS downloads, with verified SHA-256 and byte bounds. Use /environments/<name>/python; the environment is read-only during execution. Use identical pinned wheels to reuse it. When inspect lists a recipe matching the request, propose_recipe submits that exact plan by recipeId for a new approval. When inspect lists curated environment locks, use propose_locked with the lock IDs and mount names; LearnHarness expands every wheel into the exact approval plan. The sandbox permits only off or private loopback networking. Version 3 mounts only the model files pinned by the optional model field at /model. Use a model manifest from inspect when available. GPU plans can use /usr/bin/nsys. Legacy version 2 uses /model-cache. Discovery is metadata only. Never invent a dependency lock, hash, or observed result.',execute:serverExecute('experiment',schema,async (input,{toolCallId,signal})=>{
-  if(!input||Object.keys(input).sort().join(',')!==(input.action==='propose_locked'?'action,locks,plan':input.action==='propose_recipe'?'action,recipeId':input.action==='propose'?'action,plan':'action'))throw new Error('Exact discriminated action required');
-  if(input.action==='inspect')return JSON.stringify(inspectExperiments());
+ return {name:'experiment',label:'experiment',parameters:schema,executionMode:'sequential',prepareArguments:prepareExperimentArguments as never,description:'Inspect runtime and model metadata or submit one exact plan for approval. Version 3 may prepare or reuse up to four independent Python 3.12 wheel environments and run the complete comparison in one approval. Each environment lists wheel filenames from the plan’s direct HTTPS downloads, with verified SHA-256 and byte bounds. Use /environments/<name>/python; the environment is read-only during execution. Use identical pinned wheels to reuse it. To revise an earlier proposal of this lesson, call get_plan with its jobId to read the commands, then propose_variant with title, purpose, limits, exports and small exact replace edits ({command, find, replace}); everything else is carried over unchanged, which is far faster than rewriting the plan. When inspect lists a recipe matching the request, propose_recipe submits that exact plan by recipeId for a new approval. When inspect lists curated environment locks, use propose_locked with the lock IDs and mount names; LearnHarness expands every wheel into the exact approval plan. The sandbox permits only off or private loopback networking. Version 3 mounts only the model files pinned by the optional model field at /model. Use a model manifest from inspect when available. GPU plans can use /usr/bin/nsys. Legacy version 2 uses /model-cache. Discovery is metadata only. Never invent a dependency lock, hash, or observed result.',execute:serverExecute('experiment',schema,async (input:any,{toolCallId,signal})=>{
+  if(!input||(input.action==='propose_variant'?!Object.keys(input).every(k=>['action','baseJobId','title','purpose','limits','exports','replace'].includes(k)):Object.keys(input).sort().join(',')!==(input.action==='propose_locked'?'action,locks,plan':input.action==='propose_recipe'?'action,recipeId':input.action==='propose'?'action,plan':input.action==='get_plan'?'action,jobId':'action')))throw new Error('Exact discriminated action required');
+  if(input.action==='inspect'){
+   const previousProposals=ctx.jobStore.listJobs(ctx.chatId).filter(j=>j.kind==='experiment').slice(-8).map(j=>{try{const p=parsePlan(j.input);return {jobId:j.id,title:p.title,state:j.experiment?.state,status:j.status,gpu:p.gpu,commands:p.commands.length,scriptBytes:p.commands.reduce((n,c)=>n+c.reduce((m,a)=>m+a.length,0),0)};}catch{return {jobId:j.id,state:j.experiment?.state,status:j.status};}});
+   return JSON.stringify({...inspectExperiments(),previousProposals,revision:'To revise one of previousProposals, call get_plan then propose_variant with small replace edits; do not rewrite the whole plan.'});
+  }
+  if(input.action==='get_plan'){const text=JSON.stringify(compactPlan(parsePlan(proposalOf(ctx,input.jobId).input)));return text.length>80000?text.slice(0,80000)+'…[truncated]':text;}
   if(input.action==='discover_models')return JSON.stringify(await discoverModels(signal));
-  if(input.action!=='propose'&&input.action!=='propose_locked'&&input.action!=='propose_recipe')throw new Error('Unknown experiment action');
-  const plan=input.action==='propose_recipe'?loadExperimentRecipe(input.recipeId):input.action==='propose_locked'?expandEnvironmentLocks(input.plan,input.locks):parsePlan(input.plan);
+  if(input.action!=='propose'&&input.action!=='propose_locked'&&input.action!=='propose_recipe'&&input.action!=='propose_variant')throw new Error('Unknown experiment action');
+  const plan=input.action==='propose_variant'?variantPlan(ctx,input):input.action==='propose_recipe'?loadExperimentRecipe(input.recipeId):input.action==='propose_locked'?expandEnvironmentLocks(input.plan,input.locks):parsePlan(input.plan);
   const old=ctx.jobStore.findJobByToolCallId(ctx.chatId,toolCallId);
   if(old)return `Proposal ${old.id} already exists. Waiting approval is not active computation.`;
   const job=ctx.jobStore.createJob({kind:'experiment',chatId:ctx.chatId,toolCallId,input:plan,activity:'awaiting approval — no active computation'});

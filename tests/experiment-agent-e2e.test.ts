@@ -10,7 +10,7 @@ const {jobStore}=await import('../src/store/jobs.ts');
 const {chatStore}=await import('../src/store/chats.ts');
 const {createJobRunner,researchModelOverride}=await import('../src/agent/subagents/runner.ts');
 const {experimentDispatchTool}=await import('../src/agent/tools/experiment-dispatch.ts');
-const {decodeStructuredFields,experimentTool}=await import('../src/agent/tools/experiment.ts');
+const {decodeStructuredFields,experimentTool,prepareExperimentArguments}=await import('../src/agent/tools/experiment.ts');
 const {Value}=await import('typebox/value');
 const {approveExperiment,readReceipt,redeliverReceipt}=await import('../src/server/experiments/service.ts');
 const {POST:approveRoute}=await import('../app/api/experiments/[jobId]/approve/route.ts');
@@ -171,4 +171,31 @@ test('already well-formed and unrecoverable arguments are left alone',()=>{
  const good={action:'propose',plan:{...plan}};assert.equal(decodeStructuredFields(good),good);
  const cutOff={action:'propose',plan:'{"commands": [[\"x\"'};assert.equal(decodeStructuredFields(cutOff),cutOff);
  const recipe={action:'propose_recipe',recipeId:'a'.repeat(64),title:'x'};assert.equal(decodeStructuredFields(recipe),recipe);
+});
+
+function toolText(result:unknown):string {return ((result as {content?:{text?:string}[]}).content??[]).map(c=>c.text??'').join('');}
+test('get_plan, propose_variant and inspect let the specialist revise a proposal with small edits',async()=>{
+ const chat=chatStore.createChat('variant test');
+ const base=jobStore.createJob({kind:'experiment',chatId:chat.id,toolCallId:'base-proposal',input:plan,activity:'awaiting approval'});
+ const tool=experimentTool({chatId:chat.id,jobStore,spawn:()=>{throw new Error('unused');}} as never);
+ const run=(id:string,args:unknown)=>tool.execute(id,prepareExperimentArguments(args) as never,undefined as never,undefined as never);
+ assert.match(toolText(await run('i1',{action:'inspect'})),new RegExp(`"jobId":"${base.id}".*"revision":"To revise`));
+ const compact=JSON.parse(toolText(await run('g1',{action:'get_plan',jobId:base.id})));
+ assert.equal(compact.title,plan.title);assert.deepEqual(compact.commands,plan.commands);assert.equal(typeof compact.downloads,'number');
+ // edits: unknown text, then a valid one; the new proposal keeps everything else
+ await assert.rejects(()=>run('v0',{action:'propose_variant',baseJobId:base.id,replace:[{command:0,find:'no-such-text',replace:'x'}]}),/does not occur/);
+ await assert.rejects(()=>run('v0b',{action:'propose_variant',baseJobId:'job_does_not_exist'}),/Unknown proposal/);
+ const out=toolText(await run('experiment-proposal-variant',{action:'propose_variant',baseJobId:base.id,title:'Revised check',limits:{wallSeconds:5},replace:[{command:0,find:'print(2+2)',replace:'print(3+3)'}]}));
+ assert.match(out,/awaits explicit learner approval/);
+ const made=jobStore.findJobByToolCallId(chat.id,'experiment-proposal-variant')!;
+ const revised=made.input as typeof plan;
+ assert.equal(revised.title,'Revised check');assert.equal(revised.limits.wallSeconds,5);
+ assert.equal(revised.commands[0]!.at(-1),'print(3+3)');assert.equal(revised.commands[0]![0],plan.commands[0]![0]);
+ assert.deepEqual(revised.downloads,plan.downloads);assert.equal(made.experiment?.state,'awaiting_approval');
+ assert.notEqual(made.experiment?.digest,base.experiment?.digest);
+});
+test('schema errors name the requested action only, with short field messages',()=>{
+ try{prepareExperimentArguments({action:'propose_locked',plan:{},locks:[]});assert.fail('expected a throw');}
+ catch(error){const message=String((error as Error).message);assert.match(message,/^Invalid propose_locked arguments\. Fix these and resubmit: /);assert.doesNotMatch(message,/recipeId/);assert.ok(message.length<900,message.length.toString());}
+ const fine={action:'inspect'};assert.equal(prepareExperimentArguments(fine),fine);
 });

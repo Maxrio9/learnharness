@@ -131,10 +131,9 @@ const KIND_ROLE: Record<Exclude<JobKind, "experiment">, ModelRole> = {
 };
 
 /** The local model gets this long to produce a proposal; after that the configured researcher takes over.
- *  Measured on this setup: local generation is ~55 tokens/s and a full proposal needs 15-40K tokens including
- *  hidden thinking (7-13 minutes), while the researcher model needs about two. Override with
- *  LH_EXPERIMENT_LOCAL_BUDGET_SECONDS (default 150). */
-const localSpecialistBudgetMs = (): number => { const seconds = Number(process.env.LH_EXPERIMENT_LOCAL_BUDGET_SECONDS ?? 150); return (Number.isFinite(seconds) && seconds > 0 ? seconds : 150) * 1000; };
+ *  Generous by default (local generation is slow but fine for research-heavy tasks); override with
+ *  LH_EXPERIMENT_LOCAL_BUDGET_SECONDS. */
+const localSpecialistBudgetMs = (): number => { const seconds = Number(process.env.LH_EXPERIMENT_LOCAL_BUDGET_SECONDS ?? 1200); return (Number.isFinite(seconds) && seconds > 0 ? seconds : 1200) * 1000; };
 
 export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 	const { chatStore, jobStore, deliver } = deps;
