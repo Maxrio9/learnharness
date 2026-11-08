@@ -148,6 +148,10 @@ export function experimentTool(ctx:JobToolContext):AgentTool<any> {
   if(input.action==='discover_models')return JSON.stringify(await discoverModels(signal));
   if(input.action!=='propose'&&input.action!=='propose_locked'&&input.action!=='propose_recipe'&&input.action!=='propose_variant')throw new Error('Unknown experiment action');
   const plan=input.action==='propose_variant'?variantPlan(ctx,input):input.action==='propose_recipe'?loadExperimentRecipe(input.recipeId):input.action==='propose_locked'?expandEnvironmentLocks(input.plan,input.locks):parsePlan(input.plan);
+  // `tasks` caps threads and processes in the sandbox. Python with torch/CUDA and the serving engines start dozens of
+  // them; a tiny cap does not fail loudly, it deadlocks the first import (observed: tasks 8 hung for 27 minutes).
+  if((plan.gpu||plan.environments?.length)&&plan.limits.tasks<128)
+   throw new Error(`limits.tasks ${plan.limits.tasks} is too low for a plan that uses a GPU or Python environments: torch, CUDA and the serving engines start dozens of threads and processes, and a cap this small makes the first import hang forever without an error. It is a safety cap, not a resource request: use 256.`);
   // Refuse a plan that the execution gate would reject anyway: the host must have the requested RAM available
   // beyond the 4 GiB kept for the OS, measured now. This is advice at proposal time, not a guarantee later.
   {

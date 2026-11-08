@@ -230,3 +230,11 @@ test('a proposal that cannot be reserved in the host RAM available now is refuse
  const ok=toolText(await run('experiment-proposal-ok',{action:'propose',plan:{...plan,limits:{...plan.limits,memoryMiB:Math.max(64,available-4096-1024)}}}));
  assert.match(ok,/awaits explicit learner approval/);
 });
+
+test('a GPU or environment plan with a tiny task cap is refused, because torch deadlocks under it',async()=>{
+ const chat=chatStore.createChat('task cap test');
+ const tool=experimentTool({chatId:chat.id,jobStore,spawn:()=>{throw new Error('unused');}} as never);
+ const run=(id:string,args:unknown)=>tool.execute(id,prepareExperimentArguments(args) as never,undefined as never,undefined as never);
+ await assert.rejects(()=>run('experiment-proposal-tiny',{action:'propose',plan:{...plan,gpu:true,limits:{...plan.limits,tasks:8}}}),/limits\.tasks 8 is too low.*use 256/);
+ assert.ok(!jobStore.findJobByToolCallId(chat.id,'experiment-proposal-tiny'));
+});
