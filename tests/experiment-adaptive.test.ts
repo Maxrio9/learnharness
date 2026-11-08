@@ -6,7 +6,7 @@ import {join} from 'node:path';
 const root=mkdtempSync(join(tmpdir(),'lh-adaptive-'));process.env.LH_DATA_DIR=join(root,'data');process.env.LH_AUTH_FILE=join(root,'auth.json');
 const {jobStore}=await import('../src/store/jobs.ts');
 const {experimentTool}=await import('../src/agent/tools/experiment.ts');
-const {approveExperiment,startAttempt,proposeMore,setExperimentAdapter,readReceipt}=await import('../src/server/experiments/service.ts');
+const {approveExperiment,startAttempt,proposeMore,setExperimentAdapter,readReceipt,keyLines}=await import('../src/server/experiments/service.ts');
 const {parsePlan,planDigest,stripAdaptive}=await import('../src/server/experiments/plan.ts');
 
 const PY='/usr/bin/python3';
@@ -125,6 +125,15 @@ test('the agent can ask for extra downloads in one new proposal, and the session
  assert.equal(asked.title,'With the CUDA compiler');
  assert.equal(done.status,'error');assert.match((done.result as {evidence:string}).evidence,/additional downloads in a new proposal/);
  assert.equal(fresh.experiment?.digest,planDigest(asked));
+});
+
+test('failure evidence keeps root-cause lines from the middle of a long log',()=>{
+ const filler=Array.from({length:400},(_,i)=>`progress step ${i} ok`).join('\n');
+ const log=`start\n${filler}\nerror: #error -- unsupported GNU version! gcc versions later than 15 are not supported!\nfatal: posix_spawn: Resource temporarily unavailable\n${filler}\nRuntimeError: Engine core initialization failed`;
+ const keys=keyLines(log);
+ assert.match(keys,/unsupported GNU version/);assert.match(keys,/posix_spawn/);assert.match(keys,/Engine core initialization failed/);
+ assert.ok(!/progress step/.test(keys));assert.ok(keys.length<=2300);
+ assert.equal(keyLines(log+'\n'+log).split('\n').filter(l=>/unsupported GNU/.test(l)).length,1,'duplicates collapse');
 });
 
 test('an attempt can only start while the server holds a session open',()=>{

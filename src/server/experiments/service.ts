@@ -319,6 +319,17 @@ function receiptSeconds(id:string):number {
  try {const r=rawReceipt(id) as {start?:unknown;end?:unknown};const a=Date.parse(String(r.start)),b=Date.parse(String(r.end));return Number.isFinite(a)&&Number.isFinite(b)?Math.max(0,(b-a)/1000):0;}catch{return 0;}
 }
 const clip=(text:string,head:number,tail:number)=>text.length>head+tail+40?`${text.slice(0,head)}\n…[${text.length-head-tail} chars omitted]…\n${text.slice(-tail)}`:text;
+const KEY_LINE=/(error|fatal|failed|traceback|exception|cannot|can't|unsupported|not found|no such|not supported|unavailable|denied|killed|out of memory|resource temporarily|timed out|exited)/i;
+export function keyLines(text:string,limit=2200):string {
+ const seen=new Set<string>();const out:string[]=[];let size=0;
+ for(const raw of text.split('\n')){
+  const line=raw.trim().replace(/\s+/g,' ').slice(0,260);
+  if(line.length<8||!KEY_LINE.test(line)||seen.has(line))continue;
+  seen.add(line);if(size+line.length+1>limit)break;
+  out.push(line);size+=line.length+1;
+ }
+ return out.join('\n');
+}
 /** What a failed attempt printed, bounded and redacted. UNTRUSTED data for the adjusting agent. */
 export function attemptEvidence(id:string):{outcome:string;seconds:number;tail:string} {
  try {
@@ -326,7 +337,11 @@ export function attemptEvidence(id:string):{outcome:string;seconds:number;tail:s
   const text=(v:unknown)=>typeof v==='string'?v:'';
   const parts=[`outcome ${String(r.outcome)}, exit code ${r.exitCode===null||r.exitCode===undefined?'unknown':String(r.exitCode)}`];
   if(r.error)parts.push(`error: ${boundedText(r.error,300)}`);
-  if(text(r.stdout))parts.push(`stdout:\n${clip(text(r.stdout),600,3000)}`);
+  // Root causes are often in the middle of a long log (a compiler error far above the final traceback), so keep the
+  // distinctive lines of the whole output as well as its head and tail.
+  const keys=keyLines(`${text(r.stdout)}\n${text(r.stderr)}`);
+  if(keys)parts.push(`key lines from the whole output (errors, failures, unsupported or missing things):\n${keys}`);
+  if(text(r.stdout))parts.push(`stdout:\n${clip(text(r.stdout),600,3500)}`);
   if(text(r.stderr))parts.push(`stderr:\n${clip(text(r.stderr),300,1200)}`);
   return {outcome:String(r.outcome),seconds:receiptSeconds(id),tail:parts.join('\n')};
  }catch{return {outcome:'unknown',seconds:0,tail:'receipt unavailable'};}
