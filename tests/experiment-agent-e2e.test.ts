@@ -12,7 +12,7 @@ const {createJobRunner,researchModelOverride}=await import('../src/agent/subagen
 const {experimentDispatchTool}=await import('../src/agent/tools/experiment-dispatch.ts');
 const {decodeStructuredFields,experimentTool,prepareExperimentArguments}=await import('../src/agent/tools/experiment.ts');
 const {Value}=await import('typebox/value');
-const {approveExperiment,readReceipt,redeliverReceipt}=await import('../src/server/experiments/service.ts');
+const {approveExperiment,readReceipt,redeliverReceipt,hardwareFacts}=await import('../src/server/experiments/service.ts');
 const {POST:approveRoute}=await import('../app/api/experiments/[jobId]/approve/route.ts');
 const {setTurnRunner,noteSteersDurable}=await import('../src/server/jobs.ts');
 const plan={version:2,title:'Synthetic CPU check',purpose:'Test the experiment agent handoff',commands:[['/usr/bin/python3','-c','print(2+2)']],downloads:[],inputs:[],limits:{wallSeconds:10,memoryMiB:128,tasks:16,diskMiB:8,outputBytes:4096,stagedCacheMiB:0,artifactBytes:0},network:'off',gpu:false,exports:[]};
@@ -217,4 +217,16 @@ test('propose_variant arguments sent as quoted JSON strings, or with leaked tool
  // A string that is not valid JSON still fails, and the error says what went wrong.
  try{prepareExperimentArguments({action:'propose_variant',baseJobId:'job_abc',replace:'[{"command":0'});assert.fail('expected a throw');}
  catch(error){assert.match(String((error as Error).message),/\/replace must be array \(you sent a quoted string/);}
+});
+
+test('a proposal that cannot be reserved in the host RAM available now is refused with a usable number',async()=>{
+ const available=(hardwareFacts() as {hostRamAvailableMiB?:number}).hostRamAvailableMiB;
+ if(typeof available!=='number'||available-4096+1>24576||available-4096+1<64)return; // host has ample (or no readable) RAM: nothing to refuse
+ const chat=chatStore.createChat('ram feasibility test');
+ const tool=experimentTool({chatId:chat.id,jobStore,spawn:()=>{throw new Error('unused');}} as never);
+ const run=(id:string,args:unknown)=>tool.execute(id,prepareExperimentArguments(args) as never,undefined as never,undefined as never);
+ await assert.rejects(()=>run('experiment-proposal-big',{action:'propose',plan:{...plan,limits:{...plan.limits,memoryMiB:available-4096+1}}}),/cannot be reserved: only \d+ MiB.*at most \d+/);
+ assert.ok(!jobStore.findJobByToolCallId(chat.id,'experiment-proposal-big'));
+ const ok=toolText(await run('experiment-proposal-ok',{action:'propose',plan:{...plan,limits:{...plan.limits,memoryMiB:Math.max(64,available-4096-1024)}}}));
+ assert.match(ok,/awaits explicit learner approval/);
 });

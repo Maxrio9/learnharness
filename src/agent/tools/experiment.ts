@@ -4,7 +4,7 @@ import type { AgentTool } from '@earendil-works/pi-agent-core';
 import { serverExecute } from '../tool-execute.ts';
 import type { JobToolContext } from './jobs.ts';
 import { parsePlan, planDigest, type ExperimentPlan } from '../../server/experiments/plan.ts';
-import { inspectExperiments } from '../../server/experiments/service.ts';
+import { inspectExperiments, hardwareFacts } from '../../server/experiments/service.ts';
 import { expandEnvironmentLocks, loadExperimentRecipe } from '../../server/experiments/environment-locks.ts';
 import { discoverModels } from '../../server/experiments/model-catalog.ts';
 const text=Type.String({minLength:1,maxLength:8192});
@@ -148,6 +148,13 @@ export function experimentTool(ctx:JobToolContext):AgentTool<any> {
   if(input.action==='discover_models')return JSON.stringify(await discoverModels(signal));
   if(input.action!=='propose'&&input.action!=='propose_locked'&&input.action!=='propose_recipe'&&input.action!=='propose_variant')throw new Error('Unknown experiment action');
   const plan=input.action==='propose_variant'?variantPlan(ctx,input):input.action==='propose_recipe'?loadExperimentRecipe(input.recipeId):input.action==='propose_locked'?expandEnvironmentLocks(input.plan,input.locks):parsePlan(input.plan);
+  // Refuse a plan that the execution gate would reject anyway: the host must have the requested RAM available
+  // beyond the 4 GiB kept for the OS, measured now. This is advice at proposal time, not a guarantee later.
+  {
+   const available=(hardwareFacts() as {hostRamAvailableMiB?:number}).hostRamAvailableMiB;
+   if(typeof available==='number'&&plan.limits.memoryMiB>available-4096)
+    throw new Error(`limits.memoryMiB ${plan.limits.memoryMiB} cannot be reserved: only ${available} MiB of host RAM is available now and 4096 MiB are kept for the OS. Set limits.memoryMiB to at most ${Math.max(256,available-4096-1024)} (a few GiB per engine is enough for small models) and submit again.`);
+  }
   const old=ctx.jobStore.findJobByToolCallId(ctx.chatId,toolCallId);
   if(old)return `Proposal ${old.id} already exists. Waiting approval is not active computation.`;
   const job=ctx.jobStore.createJob({kind:'experiment',chatId:ctx.chatId,toolCallId,input:plan,activity:'awaiting approval — no active computation'});
