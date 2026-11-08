@@ -6,7 +6,7 @@ import {join} from 'node:path';
 const root=mkdtempSync(join(tmpdir(),'lh-adaptive-'));process.env.LH_DATA_DIR=join(root,'data');process.env.LH_AUTH_FILE=join(root,'auth.json');
 const {jobStore}=await import('../src/store/jobs.ts');
 const {experimentTool}=await import('../src/agent/tools/experiment.ts');
-const {approveExperiment,startAttempt,proposeMore,setExperimentAdapter,readReceipt,keyLines}=await import('../src/server/experiments/service.ts');
+const {approveExperiment,startAttempt,proposeMore,retryLastAttempt,setExperimentAdapter,readReceipt,keyLines}=await import('../src/server/experiments/service.ts');
 const {parsePlan,planDigest,stripAdaptive}=await import('../src/server/experiments/plan.ts');
 
 const PY='/usr/bin/python3';
@@ -169,4 +169,22 @@ test('cancelling while the agent is adjusting ends the session as cancelled',asy
  assert.equal(done.status,'error');assert.equal(done.experiment?.state,'revoked');assert.equal(attemptsOf(job.id).length,0);
  assert.throws(()=>startAttempt(job.id,{commands:fixed}),/No adjustment is open/);
 });
+test('a lost GPU lease retries the same commands and limits as a new attempt',async()=>{
+ let calls=0;
+ setExperimentAdapter(async(request)=>{
+  calls++;
+  if(calls===1)retryLastAttempt(request.parent.id,request.attempts[0]!.jobId);
+  return {note:'stopped'};
+ });
+ const job=await propose(plan(failing,{limits:{wallSeconds:20,memoryMiB:200,tasks:32,diskMiB:64,outputBytes:8192,stagedCacheMiB:1,artifactBytes:4096},adaptive:{attempts:3,totalWallSeconds:300}}));
+ const done=await approveAndSettle(job);
+ const kids=attemptsOf(job.id);
+ assert.equal(kids.length,1);
+ const again=parsePlan(kids[0]!.input),first=parsePlan(job.input);
+ assert.deepEqual(again.commands,first.commands);assert.deepEqual(again.exports,first.exports);
+ assert.equal(again.limits.memoryMiB,200);assert.equal(again.limits.tasks,32);assert.ok(again.limits.wallSeconds<=20);
+ assert.equal(calls,2,'the retry failed like the original, so the agent was asked once more');
+ assert.equal(done.status,'error');
+});
+
 process.on('exit',()=>rmSync(root,{recursive:true,force:true}));

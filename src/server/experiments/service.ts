@@ -312,6 +312,7 @@ type Adapter=(request:AdapterRequest,signal:AbortSignal)=>Promise<AdapterVerdict
 let adapter:Adapter|undefined;
 /** Registered once by the composition root; it owns the model that diagnoses a failed attempt. */
 export function setExperimentAdapter(fn:Adapter|undefined):void {adapter=fn;}
+const deferPauseMs=():number=>{const v=Number(process.env.LH_EXPERIMENT_DEFER_PAUSE_MS);return Number.isFinite(v)&&v>=0?v:20000;};
 interface Session {controller:AbortController;active?:string;chain:Promise<unknown>}
 const sessions=new Map<string,Session>();
 const childrenOf=(parent:JobRecord)=>jobStore.listJobs(parent.chatId).filter(j=>j.kind==='experiment'&&j.experiment?.parentJobId===parent.id).sort((a,b)=>a.createdAt.localeCompare(b.createdAt)||a.id.localeCompare(b.id));
@@ -393,6 +394,11 @@ export function startAttempt(parentId:string,patch:AttemptPatch):{jobId:string;n
  void runApproved(jobStore.getJob(child.id)!,canonicalPlan(derived),controller).catch(()=>{jobStore.updateJob(child.id,{error:'Attempt evidence persistence failed',activity:'recovery required'});});
  return {jobId:child.id,n};
 }
+/** Start the next attempt with exactly the commands, exports and limits of an earlier one (clamped to what remains). */
+export function retryLastAttempt(parentId:string,lastId:string):{jobId:string;n:number} {
+ const again=parsePlan(jobStore.getJob(lastId)!.input);
+ return startAttempt(parentId,{commands:again.commands,exports:again.exports,limits:Object.fromEntries(Object.entries(again.limits).filter(([,v])=>typeof v==='number'&&v>=1))});
+}
 function openSession(parentId:string):Session {
  let session=sessions.get(parentId);
  if(session)return session;
@@ -419,6 +425,19 @@ function continueSession(parentId:string,lastId:string,last:ExperimentResult,abo
   const stop=aborted||session.controller.signal.aborted||parent.experiment?.state==='revoked';
   if(stop||last.outcome==='done'||used>=budget.attempts||left<60||!adapter){
    return settleSession(parentId,lastId,last,stop?'':last.outcome==='done'?'':used>=budget.attempts?'All approved attempts were used.':left<60?'The approved time budget was used up.':'No adjusting agent was available.',stop);
+  }
+  if(last.outcome==='deferred'){
+   // The GPU lease was lost or never granted: nothing is wrong with the plan, so retry the same commands after a short
+   // pause instead of waking the agent. It still spends one of the approved attempts.
+   jobStore.updateJob(parentId,{activity:`attempt ${used} was deferred (GPU admission) — retrying shortly`});
+   await new Promise<void>(resolve=>{const timer=setTimeout(resolve,deferPauseMs());session.controller.signal.addEventListener('abort',()=>{clearTimeout(timer);resolve();},{once:true});});
+   if(!session.controller.signal.aborted){
+    try {
+     retryLastAttempt(parentId,lastId);
+     return;
+    }catch(error){return settleSession(parentId,lastId,last,`A deferred attempt could not be retried: ${String(error instanceof Error?error.message:error).slice(0,160)}`,session.controller.signal.aborted);}
+   }
+   return settleSession(parentId,lastId,last,'',true);
   }
   jobStore.updateJob(parentId,{activity:`attempt ${used} ended (${last.outcome}) — agent is adjusting (${budget.attempts-used} attempt(s) left)`});
   let note='';
