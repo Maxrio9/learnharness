@@ -10,7 +10,7 @@ MODEL_CACHE_ROOT = pathlib.Path(os.environ.get('LH_EXP_MODEL_CACHE') or (pathlib
 RETAINED_BLOBS_ROOT = pathlib.Path(os.environ.get('LH_EXP_RETAINED_BLOBS') or '/nonexistent/retained-blobs')
 MODEL_MAX_BYTES = 128 * 1024**3
 
-CLEAN = {'PATH':'/usr/bin','LANG':'C.UTF-8','HOME':'/workspace/home','TMPDIR':'/workspace/tmp'}
+CLEAN = {'PATH':'/usr/bin','LANG':'C.UTF-8','HOME':'/workspace/home','TMPDIR':'/workspace/tmp','TRITON_LIBCUDA_PATH':'/usr/lib'}  # triton looks for libcuda via /sbin/ldconfig, absent in the sandbox
 class Cancelled(Exception): pass
 class Deadline(Exception): pass
 GPU_GAP = 'GPU unsupported: admission guard process-group ownership does not cover independently launched systemd cgroup; reviewed cgroup registration/preemption adapter required.'
