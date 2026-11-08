@@ -112,7 +112,10 @@ const jobRunner = createJobRunner({
 		const cp=stores.settingsStore.readSettings()?.customProvider;
 		const localBase = process.env.LH_EXPERIMENT_LOCAL_BASE_URL;
 		if (!localBase || cp?.baseUrl !== localBase || !cp.models?.some(m=>m.id === "local")) return undefined;
-		return piEngineForSpec({provider:"custom",id:"local",thinkingLevel:"high"}, true);
+		// Local thinking is slow (~55 tokens/s): default to low. LH_EXPERIMENT_THINKING = minimal | low | medium | high.
+		const requested = process.env.LH_EXPERIMENT_THINKING;
+		const thinkingLevel = (["minimal", "low", "medium", "high"] as const).find((level) => level === requested) ?? "low";
+		return piEngineForSpec({provider:"custom",id:"local",thinkingLevel}, true);
 	},
 	// Key-presence gate (provider-key interlude, 2026-09-25): the runner
 	// reads the resolved engine's provider and asks THIS check (the agent

@@ -130,8 +130,11 @@ const KIND_ROLE: Record<Exclude<JobKind, "experiment">, ModelRole> = {
 	pdf: "pdfReader",
 };
 
-/** The local model gets this long to produce a proposal; after that the configured researcher takes over. */
-const LOCAL_SPECIALIST_BUDGET_MS = 20 * 60 * 1000;
+/** The local model gets this long to produce a proposal; after that the configured researcher takes over.
+ *  Measured on this setup: local generation is ~55 tokens/s and a full proposal needs 15-40K tokens including
+ *  hidden thinking (7-13 minutes), while the researcher model needs about two. Override with
+ *  LH_EXPERIMENT_LOCAL_BUDGET_SECONDS (default 150). */
+const localSpecialistBudgetMs = (): number => { const seconds = Number(process.env.LH_EXPERIMENT_LOCAL_BUDGET_SECONDS ?? 150); return (Number.isFinite(seconds) && seconds > 0 ? seconds : 150) * 1000; };
 
 export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 	const { chatStore, jobStore, deliver } = deps;
@@ -370,7 +373,7 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 				jobStore.updateJob(jobId, {activity:"planning experiment"});
 				const prompt=`Experimental question: ${input.question}\nContext: ${input.context ?? ""}`;
 				let primaryUsed=false;
-				const runWith = (engine: PiEngine, isPrimary=false) => { loop.setModel(engine); return runExperimenter(prompt, {engine, chatId:job.chatId, jobId, jobStore, signal:isPrimary?AbortSignal.any([loop.abortSignal,AbortSignal.timeout(LOCAL_SPECIALIST_BUDGET_MS)]):loop.abortSignal, search:deps.searchProvider, onUsage:(usage)=>{if(isPrimary && (usage.input || usage.output || usage.cacheRead || usage.cacheWrite))primaryUsed=true; if (!isPrimary || primaryUsed) loop.onUsage(piUsageToStep(usage));}, onToolStart:(name)=>jobStore.updateJob(jobId,{activity:`experiment: ${name}`})}); };
+				const runWith = (engine: PiEngine, isPrimary=false) => { loop.setModel(engine); return runExperimenter(prompt, {engine, chatId:job.chatId, jobId, jobStore, signal:isPrimary?AbortSignal.any([loop.abortSignal,AbortSignal.timeout(localSpecialistBudgetMs())]):loop.abortSignal, search:deps.searchProvider, onUsage:(usage)=>{if(isPrimary && (usage.input || usage.output || usage.cacheRead || usage.cacheWrite))primaryUsed=true; if (!isPrimary || primaryUsed) loop.onUsage(piUsageToStep(usage));}, onToolStart:(name)=>jobStore.updateJob(jobId,{activity:`experiment: ${name}`})}); };
 				let primary:PiEngine|undefined;
 				try { primary=deps.experimentEngine?.(); } catch { /* fall back to configured researcher */ }
 				let brief:string;

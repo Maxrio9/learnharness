@@ -24,6 +24,8 @@ See `docs/curriculum-experiments.md` for the learner-facing flow.
 | Variable | Purpose |
 |---|---|
 | `LH_EXPERIMENT_LOCAL_BASE_URL` | OpenAI-compatible endpoint the specialist tries first (custom provider with model id `local`); unset = use the configured researcher model only |
+| `LH_EXPERIMENT_THINKING` | Thinking level for the local specialist: `minimal`, `low` (default), `medium`, `high` |
+| `LH_EXPERIMENT_LOCAL_BUDGET_SECONDS` | How long the local model gets to produce a proposal before the researcher model takes over (default 150) |
 | `LH_EXP_PYTHON_RUNTIME` | Managed CPython 3.12 runtime directory used for sandbox environments (default: uv's standard location under `$HOME`) |
 | `LH_EXP_MODEL_CACHE` | Read-only Hugging Face cache mounted into the sandbox (default `~/.cache/huggingface/hub`) |
 | `LH_EXP_RETAINED_BLOBS` | Extra directory allowed as a symlink target for cached blobs |
